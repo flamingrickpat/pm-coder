@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pm-coder"
+version = "0.1.0"
+description = "A bounded one-shot coding agent for local OpenAI-compatible models"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.9,<3",
+    "pydantic-ai-slim[openai,mcp]>=2,<3",
+    "ruamel.yaml>=0.18,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1,<2",
+    "pytest>=8,<9",
+]
+
+[project.scripts]
+pm-coder = "pm_coder:main"
+
+[tool.setuptools]
+py-modules = ["pm_coder"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
