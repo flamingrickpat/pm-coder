@@ -41,6 +41,11 @@ from pydantic_ai import (
     UsageLimits,
     capture_run_messages,
 )
+from pydantic_ai.exceptions import (
+    ModelAPIError,
+    ModelHTTPError,
+    UsageLimitExceeded,
+)
 from pydantic_ai.mcp import load_mcp_toolsets
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models.openai import (
@@ -273,14 +278,16 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_SHELL_TIMEOUT = 180
 # Compatibility for callers that imported the old public constant.
 DEFAULT_POWERSHELL_TIMEOUT = DEFAULT_SHELL_TIMEOUT
-# None leaves these dimensions to the model/server context. Positive values
-# remain available as explicit safety overrides. -1 is accepted as a legacy
-# synonym for an unlimited response-token cap.
+# None leaves discovery and tool-output dimensions unbounded. The response
+# limit is deliberately finite: llama.cpp can otherwise spend the complete
+# context on one malformed tool-call payload. -1 remains a legacy opt-out.
 DEFAULT_MAX_TOOL_OUTPUT_CHARS: int | None = None
 DEFAULT_MAX_SKILL_INDEX_CHARS: int | None = None
 DEFAULT_MAX_PROJECT_INSTRUCTIONS_CHARS: int | None = None
-DEFAULT_MAX_TOKENS: int | None = None
+DEFAULT_MAX_TOKENS: int | None = 8_192
 DEFAULT_LOG_ROOT = Path("~/.pm/pm-coder").expanduser()
+RECOVERY_TOOL_CALL_TOKEN_TARGET = 4_000
+MAX_TRANSIENT_RETRY_DELAY_SECONDS = 30.0
 MCP_CONFIG_CANDIDATES = (
     ".mcp.json",
     "mcp.json",
@@ -474,6 +481,10 @@ class ContextLimitReachedError(TruncatedModelOutputError):
 
 class ToolCallParseError(RuntimeError):
     """The provider rejected a malformed generated tool-call payload."""
+
+
+class EndpointRequestError(RuntimeError):
+    """The endpoint rejected a request that retry feedback cannot repair."""
 
 
 @dataclass(frozen=True)
@@ -1406,7 +1417,7 @@ def _last_tool_call_summary(messages: list[Any]) -> str:
 
 
 def _generation_boundary_failure(
-    settings: Settings,
+    settings: Settings | int | None,
     messages: list[Any],
 ) -> tuple[type[TruncatedModelOutputError], str] | None:
     if _terminal_finish_reason(messages) != "length":
@@ -1427,21 +1438,39 @@ def _generation_boundary_failure(
         "keep each tool-call payload below about 4,000 generated tokens and "
         "split large scripts, commands, or file edits into smaller calls"
     )
-    if settings.max_tokens is None or settings.max_tokens == -1:
+    max_tokens = settings.max_tokens if isinstance(settings, Settings) else settings
+    if max_tokens is None or max_tokens == -1:
         return (
             ContextLimitReachedError,
             f"{activity} reached the model context limit{token_text}; {advice}",
         )
+    output_tokens = usage.get("output_tokens")
+    if (
+        isinstance(output_tokens, int)
+        and output_tokens > 0
+        and output_tokens < int(max_tokens * 0.9)
+    ):
+        return (
+            ContextLimitReachedError,
+            f"{activity} reached the model context limit{token_text} before "
+            f"it could use the {max_tokens:,}-token response limit; {advice}",
+        )
     return (
         TruncatedModelOutputError,
-        f"{activity} reached the {settings.max_tokens:,}-token response limit"
+        f"{activity} reached the {max_tokens:,}-token response limit"
         f"{token_text}; {advice}",
     )
 
 
 def _tool_call_parse_failure(exc: BaseException) -> str | None:
-    raw = str(exc)
-    if "Failed to parse tool call arguments as JSON" not in raw:
+    raw = _exception_text(exc)
+    lowered = raw.casefold()
+    known_message = "failed to parse tool call arguments as json" in lowered
+    generic_message = "tool call arguments" in lowered and any(
+        marker in lowered
+        for marker in ("invalid json", "json parse", "unterminated")
+    )
+    if not (known_message or generic_message):
         return None
     column_match = re.search(r"column (\d+)", raw)
     position = (
@@ -1462,11 +1491,195 @@ def _tool_call_parse_failure(exc: BaseException) -> str | None:
         else "tool-call payload"
     )
     return (
-        f"{subject} was rejected{position}; the provider did not report a "
-        "context-limit finish, so this can be malformed JSON rather than "
-        "context exhaustion; split large scripts, commands, or file edits "
-        "into smaller calls"
+        f"{subject} was rejected{position} because its JSON was incomplete; "
+        "the tool did not run"
     )
+
+
+def _exception_text(exc: BaseException) -> str:
+    """Return useful provider text without exposing an unbounded response body."""
+    parts = [str(exc)]
+    if isinstance(exc, ModelHTTPError) and exc.body is not None:
+        try:
+            parts.append(json.dumps(exc.body, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            parts.append(str(exc.body))
+    return "\n".join(part for part in parts if part)
+
+
+def _context_limit_failure(exc: BaseException) -> str | None:
+    raw = " ".join(_exception_text(exc).split())
+    lowered = raw.casefold()
+    markers = (
+        "context limit",
+        "context window",
+        "maximum context length",
+        "exceeds the context",
+        "exceeded the context",
+        "prompt is too long",
+        "request exceeds the available context",
+        "n_ctx",
+    )
+    if not any(marker in lowered for marker in markers):
+        return None
+    preview = raw[:600] + ("..." if len(raw) > 600 else "")
+    return (
+        "The endpoint rejected the request because the conversation reached "
+        f"the model context limit. Start a fresh kernel attempt. Provider: {preview}"
+    )
+
+
+def _is_transient_endpoint_failure(exc: BaseException) -> bool:
+    if isinstance(exc, ModelHTTPError):
+        return exc.status_code in {429, 500, 502, 503, 504}
+    if isinstance(exc, ModelAPIError):
+        return True
+    for cause in _exception_chain(exc):
+        name = type(cause).__name__.casefold()
+        module = type(cause).__module__.casefold()
+        if any(marker in name for marker in ("connection", "connect", "timeout")):
+            return True
+        if module.startswith(("httpx", "httpcore", "openai")) and isinstance(
+            cause, (OSError, TimeoutError)
+        ):
+            return True
+    return False
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _endpoint_failure(exc: BaseException) -> tuple[type[RuntimeError], str] | None:
+    context = _context_limit_failure(exc)
+    if context is not None:
+        return ContextLimitReachedError, context
+    if not isinstance(exc, ModelHTTPError):
+        return None
+    status = exc.status_code
+    explanations = {
+        400: "The endpoint rejected the request as invalid.",
+        401: "The endpoint rejected the API credentials.",
+        403: "The endpoint denied access to the model or operation.",
+        404: "The endpoint or requested model was not found.",
+        413: "The endpoint rejected the request because its payload was too large.",
+        422: "The endpoint could not process the request payload.",
+    }
+    summary = explanations.get(status, f"The endpoint returned HTTP {status}.")
+    raw = " ".join(_exception_text(exc).split())
+    if len(raw) > 600:
+        raw = raw[:597] + "..."
+    return EndpointRequestError, f"{summary} Provider: {raw}"
+
+
+def _safe_recovery_history(messages: list[Any], *, prefix_count: int) -> list[Any]:
+    """Keep completed history and remove only the failed terminal exchange."""
+    data = to_jsonable_python(messages)
+    cutoff = len(messages)
+    for index in range(prefix_count, len(messages)):
+        item = data[index]
+        if isinstance(item, dict) and item.get("state") == "interrupted":
+            cutoff = index
+            break
+    for index in range(cutoff - 1, prefix_count - 1, -1):
+        item = data[index]
+        if (
+            isinstance(item, dict)
+            and item.get("kind") == "response"
+            and _terminal_finish_reason([item]) == "length"
+        ):
+            cutoff = index
+            break
+    return list(messages[:cutoff])
+
+
+def _transient_recovery_state(
+    messages: list[Any],
+    *,
+    prefix_count: int,
+    retry_prompt: str,
+) -> tuple[list[Any], str]:
+    """Retry an unanswered user prompt without adding it to the history."""
+    history = _safe_recovery_history(messages, prefix_count=prefix_count)
+    if len(history) <= prefix_count:
+        return history, retry_prompt
+    data = to_jsonable_python(history[-1])
+    if not isinstance(data, dict) or data.get("kind") != "request":
+        return history, _transient_retry_feedback()
+    parts = data.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return history, _transient_retry_feedback()
+    kinds = {
+        part.get("part_kind") or part.get("kind")
+        for part in parts
+        if isinstance(part, dict)
+    }
+    if kinds and kinds <= {"system-prompt", "user-prompt"}:
+        return history[:-1], retry_prompt
+    return history, _transient_retry_feedback()
+
+
+def _merge_usage(total: dict[str, Any], addition: Mapping[str, Any]) -> None:
+    for key, value in addition.items():
+        if isinstance(value, Mapping):
+            nested = total.setdefault(key, {})
+            if isinstance(nested, dict):
+                _merge_usage(nested, value)
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            total[key] = int(total.get(key, 0) or 0) + value
+        elif key not in total:
+            total[key] = value
+
+
+def _response_limit_feedback(max_tokens: int | None) -> str:
+    limit = f"{max_tokens:,}" if max_tokens not in {None, -1} else "the available"
+    return (
+        f"The previous response reached {limit} generated tokens and was discarded. "
+        "Do not repeat or enlarge it. Inspect the current repository state. "
+        f"Keep each tool-call payload below about {RECOVERY_TOOL_CALL_TOKEN_TARGET:,} "
+        "generated tokens. Split a large script, command, or file edit into short "
+        "sequential edits. Continue the assigned role and return its required result."
+    )
+
+
+def _tool_call_parse_feedback(detail: str) -> str:
+    return (
+        f"The endpoint rejected the previous response: {detail} "
+        "Do not repeat or enlarge that tool call. Inspect the current repository state. "
+        f"Keep each tool-call payload below about {RECOVERY_TOOL_CALL_TOKEN_TARGET:,} "
+        "generated tokens. Create a small file skeleton first, then add sections with "
+        "short sequential edits. Continue the assigned role and return its required result."
+    )
+
+
+def _transient_retry_feedback() -> str:
+    return (
+        "The model endpoint disconnected or restarted. Continue the assigned role "
+        "from the current repository state. Do not repeat a tool call that already ran."
+    )
+
+
+def _remaining_wall_clock(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("the agent turn reached its wall-clock limit")
+    return remaining
+
+
+def _transient_retry_delay(exc: BaseException, consecutive: int) -> float:
+    if isinstance(exc, ModelHTTPError) and exc.retry_after is not None:
+        return min(MAX_TRANSIENT_RETRY_DELAY_SECONDS, max(0.0, exc.retry_after))
+    return min(MAX_TRANSIENT_RETRY_DELAY_SECONDS, float(2 ** min(consecutive - 1, 5)))
 
 
 def _workspace_path(path: Path, workspace: Path) -> str:
@@ -1709,26 +1922,136 @@ def _usage_dict(usage: Any) -> dict[str, Any]:
 async def _run_agent_turn(
     agent: Agent[Any, str],
     prompt: str,
-    message_history: list[Any],
+    message_history: list[Any] | None,
     *,
+    max_tokens: int | None = DEFAULT_MAX_TOKENS,
     request_limit: int | None = None,
     wall_clock_limit: int | None = None,
-) -> tuple[Any, list[Any]]:
-    limits = UsageLimits(request_limit=request_limit) if request_limit is not None else None
-    captured: list[Any]
-    with capture_run_messages() as captured:
-        with Agent.parallel_tool_call_execution_mode("sequential"):
-            call = agent.run(
-                prompt,
-                message_history=message_history or None,
-                **({"usage_limits": limits} if limits is not None else {}),
+) -> tuple[Any, list[Any], dict[str, Any]]:
+    history = list(message_history or [])
+    next_prompt = prompt
+    used_requests = 0
+    total_usage: dict[str, Any] = {}
+    transient_failures = 0
+    deadline = (
+        time.monotonic() + wall_clock_limit
+        if wall_clock_limit is not None
+        else None
+    )
+
+    while True:
+        remaining_requests = (
+            request_limit - used_requests if request_limit is not None else None
+        )
+        if remaining_requests is not None and remaining_requests <= 0:
+            raise UsageLimitExceeded(
+                f"The agent turn used its {request_limit} model requests"
             )
-            result = await (
-                asyncio.wait_for(call, timeout=wall_clock_limit)
-                if wall_clock_limit is not None
-                else call
+        limits = (
+            UsageLimits(request_limit=remaining_requests)
+            if remaining_requests is not None
+            else None
+        )
+        captured: list[Any] = []
+        try:
+            with capture_run_messages() as captured:
+                with Agent.parallel_tool_call_execution_mode("sequential"):
+                    call = agent.run(
+                        next_prompt,
+                        message_history=history or None,
+                        **({"usage_limits": limits} if limits is not None else {}),
+                    )
+                    timeout = _remaining_wall_clock(deadline)
+                    result = await (
+                        asyncio.wait_for(call, timeout=timeout)
+                        if timeout is not None
+                        else call
+                    )
+        except BaseException as exc:
+            new_messages = captured[len(history) :]
+            observed_usage = _captured_usage(to_jsonable_python(new_messages))
+            _merge_usage(total_usage, observed_usage)
+            completed_requests = int(observed_usage.get("requests", 0) or 0)
+            safe_history = _safe_recovery_history(
+                captured,
+                prefix_count=len(history),
             )
-    return result, captured
+
+            parse_failure = _tool_call_parse_failure(exc)
+            boundary_failure = _generation_boundary_failure(
+                max_tokens,
+                to_jsonable_python(captured),
+            )
+            if parse_failure is not None:
+                used_requests += completed_requests + 1
+                total_usage["requests"] = int(total_usage.get("requests", 0) or 0) + 1
+                history = safe_history
+                next_prompt = _tool_call_parse_feedback(parse_failure)
+                transient_failures = 0
+                print(f"pm-coder recovery: {parse_failure}", file=sys.stderr, flush=True)
+                continue
+            if boundary_failure is not None:
+                error_class, detail = boundary_failure
+                if error_class is ContextLimitReachedError:
+                    raise error_class(detail) from exc
+                used_requests += completed_requests
+                history = safe_history
+                next_prompt = _response_limit_feedback(max_tokens)
+                transient_failures = 0
+                print(f"pm-coder recovery: {detail}", file=sys.stderr, flush=True)
+                continue
+            context_failure = _context_limit_failure(exc)
+            if context_failure is not None:
+                raise ContextLimitReachedError(context_failure) from exc
+            if _is_transient_endpoint_failure(exc):
+                used_requests += completed_requests
+                history, next_prompt = _transient_recovery_state(
+                    captured,
+                    prefix_count=len(history),
+                    retry_prompt=next_prompt,
+                )
+                transient_failures += 1
+                delay = _transient_retry_delay(exc, transient_failures)
+                print(
+                    "pm-coder endpoint unavailable; retrying in "
+                    f"{delay:g}s without charging the failed request",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                remaining = _remaining_wall_clock(deadline)
+                if remaining is not None and delay >= remaining:
+                    raise TimeoutError(
+                        "the model endpoint did not recover before the wall-clock limit"
+                    ) from exc
+                await asyncio.sleep(delay)
+                continue
+            endpoint_failure = _endpoint_failure(exc)
+            if endpoint_failure is not None:
+                error_class, detail = endpoint_failure
+                raise error_class(detail) from exc
+            raise
+
+        result_usage = _usage_dict(result.usage)
+        boundary_failure = _generation_boundary_failure(
+            max_tokens,
+            to_jsonable_python(result.all_messages()),
+        )
+        if boundary_failure is None:
+            _merge_usage(total_usage, result_usage)
+            return result, captured, total_usage
+
+        error_class, detail = boundary_failure
+        _merge_usage(total_usage, result_usage)
+        used_requests += int(result_usage.get("requests", 0) or 0)
+        if error_class is ContextLimitReachedError:
+            raise error_class(detail)
+        history = _safe_recovery_history(
+            result.all_messages(),
+            prefix_count=len(history),
+        )
+        next_prompt = _response_limit_feedback(max_tokens)
+        transient_failures = 0
+        print(f"pm-coder recovery: {detail}", file=sys.stderr, flush=True)
 
 
 async def async_run_auto(
@@ -1793,17 +2116,18 @@ async def async_run_auto(
     started = time.perf_counter()
     try:
         async with agent:
-            result, captured = await _run_agent_turn(
+            result, captured, turn_usage = await _run_agent_turn(
                 agent,
                 prompt,
                 history,
+                max_tokens=settings.max_tokens,
                 request_limit=request_limit,
                 wall_clock_limit=wall_clock_limit,
             )
         messages = result.all_messages()
         session.save_messages(messages)
         duration = round(time.perf_counter() - started, 6)
-        usage = _usage_dict(result.usage)
+        usage = turn_usage
         output = AutoResult(
             response=str(result.output),
             run_id=session.run_id,
@@ -1953,10 +2277,11 @@ async def interactive_loop(
                 continue
             if not prompt.strip():
                 continue
-            result, _captured = await _run_agent_turn(
+            result, _captured, turn_usage = await _run_agent_turn(
                 agent,
                 prompt,
                 message_history,
+                max_tokens=settings.max_tokens,
             )
             message_history = result.all_messages()
             session.save_messages(message_history)
@@ -1965,7 +2290,7 @@ async def interactive_loop(
                     "timestamp": utc_now(),
                     "prompt": prompt,
                     "response": str(result.output),
-                    "tokens_used": _usage_dict(result.usage),
+                    "tokens_used": turn_usage,
                 }
             )
             print(f"\nAgent> {result.output}\n")

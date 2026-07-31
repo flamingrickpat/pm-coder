@@ -42,12 +42,22 @@ Each session also contains `messages.yaml`, a human-readable rendering with
 Use `messages.json` for replay; use `messages.yaml` for inspection.
 
 The agent uses the local OpenAI-compatible endpoint at
-`http://127.0.0.1:8080/v1` wiht `qwen`  model by default. 
-Use the command-line options to select a
-model, working directory, MCP configuration, shell, and execution limits.
-Thinking and response length are unlimited by this client by default. The
-server's context window, EOS, and any explicit `--max-tokens` or
-`--disable-thinking` option remain the effective boundaries.
+`http://127.0.0.1:8080/v1` with the `qwen` model by default. Use command-line
+options to select a model, working directory, MCP configuration, shell, and
+execution limits.
+
+The default response limit is 8,192 generated tokens. Use `--max-tokens` to
+change it. Use `--max-tokens -1` to remove the client response limit.
+
+Auto and interactive modes recover when a response reaches the client limit.
+The agent removes the incomplete response and asks the model to use shorter
+tool calls. It uses the completed message and repository state from before the
+failure. It also recovers from a known malformed tool-call HTTP 500 response.
+
+Connection failures and restart-class HTTP responses use exponential retry.
+The failed endpoint request does not use the agent request budget. The same
+wall-clock limit still applies. A real model-context error ends the turn so the
+workflow kernel can start a fresh attempt.
 
 Interactive commands include `/clear`, `/info`, `/paste`, and `/quit`.
 

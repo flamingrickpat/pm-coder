@@ -67,7 +67,7 @@ def test_auto_cli_arguments_accept_literal_prompt_and_file_prompt() -> None:
     assert file_prompt.mode == "auto"
     assert file_prompt.prompt_file == "prompt.txt"
     assert file_prompt.run_id == "old"
-    assert literal.max_tokens is None
+    assert literal.max_tokens == 8_192
     assert literal.max_tool_output is None
     assert literal.max_skill_index is None
     assert literal.max_project_instructions is None
