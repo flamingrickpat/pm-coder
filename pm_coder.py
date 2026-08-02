@@ -26,7 +26,6 @@ from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from hashlib import sha256
 from io import StringIO
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -35,8 +34,6 @@ from xml.sax.saxutils import escape, quoteattr
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_ai import (
     Agent,
-    ModelRetry,
-    RunContext,
     Tool,
     UsageLimits,
     capture_run_messages,
@@ -54,10 +51,6 @@ from pydantic_ai.models.openai import (
 )
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.toolsets import (
-    ToolsetTool,
-    WrapperToolset,
-)
 from pydantic_core import to_jsonable_python
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import FoldedScalarString, LiteralScalarString
@@ -485,47 +478,6 @@ class ToolCallParseError(RuntimeError):
 
 class EndpointRequestError(RuntimeError):
     """The endpoint rejected a request that retry feedback cannot repair."""
-
-
-@dataclass(frozen=True)
-class PlanCheckpoint:
-    """The assigned plan state captured before a one-shot worker starts."""
-
-    path: Path
-    initial_sha256: str
-
-    def satisfied(self) -> bool:
-        try:
-            current = sha256(self.path.read_bytes()).hexdigest()
-        except OSError:
-            return False
-        return current != self.initial_sha256
-
-
-@dataclass
-class PlanCheckpointToolset(WrapperToolset[Any]):
-    """Require a saved plan checkpoint before physical Minecraft effects."""
-
-    checkpoint: PlanCheckpoint
-
-    async def call_tool(
-        self,
-        name: str,
-        tool_args: dict[str, Any],
-        ctx: RunContext[Any],
-        tool: ToolsetTool[Any],
-    ) -> Any:
-        if (
-            _is_state_changing_minecraft_tool(name)
-            and not self.checkpoint.satisfied()
-        ):
-            raise ModelRetry(
-                "Before a state-changing Minecraft call, save a short "
-                "dependency plan to the assigned plan file using the fresh "
-                "typed observation. Then retry only after the plan file has "
-                "actually changed."
-            )
-        return await self.wrapped.call_tool(name, tool_args, ctx, tool)
 
 
 @dataclass(frozen=True)
@@ -1180,8 +1132,6 @@ def discover_workspace(settings: Settings) -> DiscoveryResult:
 def build_agent(
     settings: Settings,
     discovery: DiscoveryResult,
-    *,
-    plan_checkpoint: PlanCheckpoint | None = None,
 ) -> Agent[Any, str]:
     profile = OpenAIModelProfile(
         openai_supports_strict_tool_definition=False,
@@ -1200,14 +1150,6 @@ def build_agent(
         if settings.mcp_config is not None
         else []
     )
-    if plan_checkpoint is not None:
-        toolsets = [
-            PlanCheckpointToolset(
-                wrapped=toolset,
-                checkpoint=plan_checkpoint,
-            )
-            for toolset in toolsets
-        ]
     return Agent(
         model=model,
         instructions=build_system_prompt(
@@ -1259,56 +1201,6 @@ def one_shot_options(args: argparse.Namespace) -> OneShotOptions | None:
         artifact_dir=Path(args.artifact_dir).expanduser().resolve(),
         request_limit=args.request_limit,
         wall_clock_limit_seconds=args.wall_clock_limit,
-    )
-
-
-def plan_checkpoint_for_one_shot(
-    settings: Settings,
-    options: OneShotOptions,
-) -> PlanCheckpoint | None:
-    """Capture the assigned plan named by a generated heartbeat prompt."""
-    prompt = options.prompt_file.read_text(encoding="utf-8")
-    match = re.search(
-        r"(?m)^assigned_plan_file:\s*(?:\r?\n[ \t]+)?"
-        r"(?P<path>\S+\.plan\.md)\s*$",
-        prompt,
-    )
-    if match is None:
-        return None
-    path = (settings.cwd / match.group("path")).resolve()
-    try:
-        relative = path.relative_to(settings.cwd.resolve())
-    except ValueError as exc:
-        raise ValueError(
-            "assigned plan file is outside the agent workspace"
-        ) from exc
-    if not relative.parts or relative.parts[0] != "tasks":
-        raise ValueError("assigned plan file must be under tasks/")
-    if not path.is_file():
-        raise ValueError(f"assigned plan file does not exist: {relative}")
-    return PlanCheckpoint(
-        path=path,
-        initial_sha256=sha256(path.read_bytes()).hexdigest(),
-    )
-
-
-def _is_state_changing_minecraft_tool(name: str) -> bool:
-    return any(
-        name.endswith(suffix)
-        for suffix in (
-            "minecraft_call",
-            "minecraft_walk_to",
-            "minecraft_mine_block",
-            "minecraft_pillar_up",
-            "minecraft_collect_blocks",
-            "minecraft_craft_item",
-            "minecraft_smelt_item",
-            "minecraft_equip",
-            "minecraft_rotate",
-            "minecraft_execute_typescript",
-            "minecraft_suicide",
-            "minecraft_retire_character",
-        )
     )
 
 
@@ -2304,11 +2196,7 @@ async def async_main(argv: list[str] | None = None) -> None:
     options = one_shot_options(args)
     if options is not None:
         os.chdir(settings.cwd)
-        agent = build_agent(
-            settings,
-            discovery,
-            plan_checkpoint=plan_checkpoint_for_one_shot(settings, options),
-        )
+        agent = build_agent(settings, discovery)
         output = await run_one_shot(agent, settings, discovery, options)
         print(output)
         return
