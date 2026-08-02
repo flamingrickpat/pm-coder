@@ -1677,8 +1677,9 @@ def _remaining_wall_clock(deadline: float | None) -> float | None:
 
 
 def _transient_retry_delay(exc: BaseException, consecutive: int) -> float:
-    if isinstance(exc, ModelHTTPError) and exc.retry_after is not None:
-        return min(MAX_TRANSIENT_RETRY_DELAY_SECONDS, max(0.0, exc.retry_after))
+    retry_after = getattr(exc, "retry_after", None) if isinstance(exc, ModelHTTPError) else None
+    if isinstance(retry_after, (int, float)):
+        return min(MAX_TRANSIENT_RETRY_DELAY_SECONDS, max(0.0, float(retry_after)))
     return min(MAX_TRANSIENT_RETRY_DELAY_SECONDS, float(2 ** min(consecutive - 1, 5)))
 
 
