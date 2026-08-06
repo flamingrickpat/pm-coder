@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
@@ -44,7 +45,11 @@ from pydantic_ai.exceptions import (
     UsageLimitExceeded,
 )
 from pydantic_ai.mcp import load_mcp_toolsets
-from pydantic_ai.messages import ModelMessagesTypeAdapter
+from pydantic_ai.messages import (
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    UserPromptPart,
+)
 from pydantic_ai.models.openai import (
     OpenAIChatModel,
     OpenAIChatModelSettings,
@@ -280,6 +285,12 @@ DEFAULT_MAX_PROJECT_INSTRUCTIONS_CHARS: int | None = None
 DEFAULT_MAX_TOKENS: int | None = 8_192
 DEFAULT_LOG_ROOT = Path("~/.pm/pm-coder").expanduser()
 RECOVERY_TOOL_CALL_TOKEN_TARGET = 4_000
+# Context compaction defaults mirror the upstream pi coding agent so a tuned
+# setup behaves identically out of the box. The context window itself is the
+# model's, so it is separate and configurable.
+DEFAULT_CONTEXT_WINDOW: int = 65_536
+DEFAULT_COMPACT_RESERVE_TOKENS: int = 16_384
+DEFAULT_COMPACT_KEEP_RECENT_TOKENS: int = 20_000
 MAX_TRANSIENT_RETRY_DELAY_SECONDS = 30.0
 MCP_CONFIG_CANDIDATES = (
     ".mcp.json",
@@ -309,6 +320,11 @@ class Settings(StrictModel):
     temperature: float
     max_tokens: int | None = DEFAULT_MAX_TOKENS
     disable_thinking: bool = False
+    skill: str | None = None
+    auto_compact: bool = False
+    context_window: int = DEFAULT_CONTEXT_WINDOW
+    compact_reserve_tokens: int = DEFAULT_COMPACT_RESERVE_TOKENS
+    compact_keep_recent_tokens: int = DEFAULT_COMPACT_KEEP_RECENT_TOKENS
 
     @model_validator(mode="after")
     def paths_exist(self) -> Settings:
@@ -495,6 +511,7 @@ class DiscoveryResult:
     instruction_files: list[Path]
     project_instructions: str
     mcp_server_names: list[str]
+    selected_skill: Skill | None
 
 
 class ShellBackend(ABC):
@@ -671,6 +688,60 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             DEFAULT_MAX_PROJECT_INSTRUCTIONS_CHARS,
         ),
         help="Maximum instruction characters; omitted means unlimited.",
+    )
+    parser.add_argument(
+        "--skill",
+        help=(
+            "Load exactly one skill by name and inject its full SKILL.md into "
+            "the system context before the user request. The name matches the "
+            "skill frontmatter name or its folder name, case-insensitively. "
+            "The generic skill index is replaced by the selected skill's body."
+        ),
+    )
+    parser.add_argument(
+        "--auto-compact",
+        dest="auto_compact",
+        action="store_true",
+        help=(
+            "Compress long sessions automatically. When the estimated context "
+            "exceeds --context-window minus --compact-reserve-tokens, summarize "
+            "the older turns with a short LLM pass and keep only the most "
+            "recent ~--compact-keep-recent-tokens of context."
+        ),
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=env_optional_int(
+            "LOCAL_AGENT_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW
+        ),
+        help=(
+            "Estimated model context window in tokens (default 65536). Used "
+            "only by --auto-compact to decide when to summarize."
+        ),
+    )
+    parser.add_argument(
+        "--compact-reserve-tokens",
+        type=int,
+        default=env_optional_int(
+            "LOCAL_AGENT_COMPACT_RESERVE", DEFAULT_COMPACT_RESERVE_TOKENS
+        ),
+        help=(
+            "Tokens reserved for the next response when deciding to compact "
+            "(default 16384)."
+        ),
+    )
+    parser.add_argument(
+        "--compact-keep-recent-tokens",
+        type=int,
+        default=env_optional_int(
+            "LOCAL_AGENT_COMPACT_KEEP_RECENT",
+            DEFAULT_COMPACT_KEEP_RECENT_TOKENS,
+        ),
+        help=(
+            "Approximate tokens of the most recent conversation kept verbatim "
+            "after compaction (default 20000)."
+        ),
     )
     parser.add_argument(
         "--temperature",
@@ -1045,6 +1116,7 @@ def build_system_prompt(
     skill_index: str,
     project_instructions: str,
     mcp_server_names: list[str],
+    selected_skill: Skill | None = None,
 ) -> str:
     mcp_summary = ", ".join(mcp_server_names) or "none configured"
     shell = shell_backend(settings)
@@ -1056,6 +1128,21 @@ def build_system_prompt(
         else "\nMCP tools are exposed with server prefixes. Use them when the "
         "assigned workflow or project instructions require them.\n"
     )
+    if selected_skill is not None:
+        try:
+            body = selected_skill.skill_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            body = f"<unable to read {selected_skill.skill_file}: {exc}>"
+        skill_block = (
+            "A specific skill was selected on the command line. Read and follow "
+            "it for the entire session.\n\n"
+            f"<selected_skill name={quoteattr(selected_skill.name)}>\n"
+            f"{body}\n"
+            "</selected_skill>\n"
+            "The generic skill index is replaced by this selected skill."
+        )
+    else:
+        skill_block = skill_index
     return textwrap.dedent(
         f"""
         You are a local coding agent operating directly in one
@@ -1082,7 +1169,7 @@ def build_system_prompt(
         Skills are reusable workflows. If one clearly applies, read its full
         SKILL.md before using it.
 
-        {skill_index}
+        {skill_block}
 
         Apply these discovered project instructions:
 
@@ -1111,11 +1198,38 @@ def build_settings(args: argparse.Namespace) -> Settings:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         disable_thinking=not args.enable_thinking,
+        skill=args.skill,
+        auto_compact=args.auto_compact,
+        context_window=args.context_window or DEFAULT_CONTEXT_WINDOW,
+        compact_reserve_tokens=(
+            args.compact_reserve_tokens or DEFAULT_COMPACT_RESERVE_TOKENS
+        ),
+        compact_keep_recent_tokens=(
+            args.compact_keep_recent_tokens
+            or DEFAULT_COMPACT_KEEP_RECENT_TOKENS
+        ),
     )
+
+
+def _find_skill(skills: list[Skill], name: str) -> Skill | None:
+    wanted = name.casefold()
+    for skill in skills:
+        if skill.name.casefold() == wanted:
+            return skill
+    return None
 
 
 def discover_workspace(settings: Settings) -> DiscoveryResult:
     skills, skill_errors = load_skills(settings.cwd)
+    selected_skill: Skill | None = None
+    if settings.skill:
+        selected_skill = _find_skill(skills, settings.skill)
+        if selected_skill is None:
+            available = ", ".join(sorted(s.name for s in skills)) or "(none)"
+            raise FileNotFoundError(
+                f"Skill {settings.skill!r} was not found. "
+                f"Available skills: {available}"
+            )
     instruction_files = discover_instruction_files(settings.cwd)
     return DiscoveryResult(
         skills=skills,
@@ -1126,6 +1240,7 @@ def discover_workspace(settings: Settings) -> DiscoveryResult:
             settings.max_project_instructions_chars,
         ),
         mcp_server_names=read_mcp_server_names(settings.mcp_config),
+        selected_skill=selected_skill,
     )
 
 
@@ -1160,6 +1275,7 @@ def build_agent(
             ),
             discovery.project_instructions,
             discovery.mcp_server_names,
+            discovery.selected_skill,
         ),
         tools=[make_shell_tool(settings)],
         toolsets=toolsets,
@@ -1175,6 +1291,50 @@ def build_agent(
         ),
         retries=3,
         max_concurrency=1,
+    )
+
+
+def _make_model(settings: Settings) -> OpenAIChatModel:
+    """Shared OpenAI-compatible model used by the agent and summarization."""
+    profile = OpenAIModelProfile(
+        openai_supports_strict_tool_definition=False,
+        openai_chat_supports_multiple_system_messages=False,
+    )
+    return OpenAIChatModel(
+        settings.model,
+        provider=OpenAIProvider(
+            base_url=settings.base_url,
+            api_key=settings.api_key,
+        ),
+        profile=profile,
+    )
+
+
+def _make_summary_agent(settings: Settings) -> Agent[Any, str]:
+    """A tool-less agent that summarizes conversation prefixes for compaction."""
+    max_tokens = min(
+        8_192,
+        max(1_024, int(settings.compact_reserve_tokens * 0.8)),
+    )
+    return Agent(
+        model=_make_model(settings),
+        system_prompt=(
+            "You summarize a coding-agent conversation into a concise, "
+            "structured checkpoint summary that another LLM will use to "
+            "continue the work. Preserve exact file paths, function names, and "
+            "error messages. Return only the summary."
+        ),
+        model_settings=OpenAIChatModelSettings(
+            temperature=0.0,
+            max_tokens=max_tokens,
+            parallel_tool_calls=False,
+            extra_body=(
+                {"chat_template_kwargs": {"enable_thinking": False}}
+                if settings.disable_thinking
+                else {}
+            ),
+        ),
+        retries=1,
     )
 
 
@@ -1812,16 +1972,300 @@ def _usage_dict(usage: Any) -> dict[str, Any]:
     return value
 
 
+# Context compaction. This mirrors the upstream pi coding agent's logic:
+# trigger when the estimated context exceeds (context_window - reserve), find
+# a cut point that keeps roughly keep_recent_tokens worth of the most recent
+# turns, summarize everything older with one LLM pass, and replace that prefix
+# with the summary as a user-role checkpoint message.
+SUMMARIZATION_PROMPT = """The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages."""
+
+
+def _content_text(part: dict[str, Any]) -> str:
+    """Render one message part's content as plain text for the summary input."""
+    content = part.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        blocks: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "image":
+                blocks.append("[image]")
+            elif isinstance(block.get("text"), str):
+                blocks.append(block["text"])
+        return " ".join(blocks)
+    return ""
+
+
+def estimate_message_tokens(message: dict[str, Any]) -> int:
+    """Estimate tokens in one model message using a conservative chars/4 rule."""
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return 0
+    chars = 0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("part_kind") or part.get("kind")
+        if kind == "tool-call":
+            args = part.get("args")
+            if isinstance(args, str):
+                args_text = args
+            else:
+                try:
+                    args_text = json.dumps(args, sort_keys=True)
+                except Exception:
+                    args_text = ""
+            chars += len(part.get("tool_name") or "") + len(args_text)
+            continue
+        content = part.get("content")
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "image":
+                    chars += 4800
+                elif isinstance(block.get("text"), str):
+                    chars += len(block["text"])
+    return max(1, math.ceil(chars / 4))
+
+
+def estimate_context_tokens(data: list[dict[str, Any]]) -> int:
+    """Best-effort context size: last assistant usage plus trailing estimate."""
+    for index in range(len(data) - 1, -1, -1):
+        message = data[index]
+        if not isinstance(message, dict) or message.get("kind") != "response":
+            continue
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        total = usage.get("total_tokens")
+        if isinstance(total, int) and total > 0:
+            trailing = sum(
+                estimate_message_tokens(m) for m in data[index + 1 :]
+            )
+            return total + trailing
+    return sum(estimate_message_tokens(m) for m in data)
+
+
+def _is_cut_point(message: dict[str, Any]) -> bool:
+    """True for the start of a fresh user turn (never a tool-return echo)."""
+    if not isinstance(message, dict) or message.get("kind") != "request":
+        return False
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return False
+    kinds = {
+        part.get("part_kind") or part.get("kind")
+        for part in parts
+        if isinstance(part, dict)
+    }
+    if "tool-return" in kinds:
+        return False
+    return "user-prompt" in kinds
+
+
+def _find_cut_index(
+    data: list[dict[str, Any]], keep_recent_tokens: int
+) -> int | None:
+    """Index of the first message to keep (start of a user turn).
+
+    Walks backward from the newest message accumulating estimated tokens and
+    cuts at the closest fresh user-turn boundary at or after the point where
+    the accumulated budget is reached. This never splits a turn and never cuts
+    at a tool result, mirroring the upstream pi logic.
+    """
+    cut_points = [
+        i for i, message in enumerate(data) if _is_cut_point(message)
+    ]
+    if not cut_points:
+        return None
+    accumulated = 0
+    cut_index = cut_points[0]
+    for i in range(len(data) - 1, -1, -1):
+        accumulated += estimate_message_tokens(data[i])
+        if accumulated >= keep_recent_tokens:
+            for candidate in cut_points:
+                if candidate >= i:
+                    cut_index = candidate
+                    break
+            break
+    return cut_index
+
+
+def _serialize_conversation(data: list[dict[str, Any]]) -> str:
+    """Flatten messages to readable text for the summarization prompt."""
+    lines: list[str] = []
+    for index, message in enumerate(data):
+        kind = message.get("kind")
+        parts = message.get("parts") or []
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            part_kind = part.get("part_kind") or part.get("kind")
+            if kind == "request" and part_kind in {"user-prompt", "tool-return"}:
+                label = (
+                    "USER" if part_kind == "user-prompt" else "TOOL RESULT"
+                )
+                lines.append(f"{label} [{index}]: {_content_text(part)}")
+            elif kind == "response":
+                if part_kind == "tool-call":
+                    name = part.get("tool_name") or ""
+                    args = part.get("args")
+                    if isinstance(args, str):
+                        args_text = args
+                    else:
+                        try:
+                            args_text = json.dumps(args, sort_keys=True)
+                        except Exception:
+                            args_text = ""
+                    lines.append(f"TOOL CALL [{index}]: {name}({args_text})")
+                elif part_kind in {"text", "final-output"}:
+                    lines.append(f"ASSISTANT [{index}]: {_content_text(part)}")
+                elif part_kind == "reasoning":
+                    text = _content_text(part)
+                    if text:
+                        lines.append(f"REASONING [{index}]: {text}")
+    return "\n".join(lines)
+
+
+async def _maybe_compact_history(
+    agent: Agent[Any, str],
+    settings: Settings,
+    history: list[Any],
+) -> list[Any]:
+    """Summarize older turns when the context grows large; return new history.
+
+    A failed summarization never breaks the session: it logs a warning and
+    returns the original history unchanged.
+    """
+    if not settings.auto_compact or not history:
+        return history
+    data = to_jsonable_python(history)
+    if not isinstance(data, list):
+        return history
+    context_tokens = estimate_context_tokens(data)
+    threshold = settings.context_window - settings.compact_reserve_tokens
+    if context_tokens <= threshold:
+        return history
+    cut_index = _find_cut_index(data, settings.compact_keep_recent_tokens)
+    if cut_index is None or cut_index <= 0:
+        return history
+    prefix = history[:cut_index]
+    kept = history[cut_index:]
+    if not kept:
+        return history
+    conversation_text = _serialize_conversation(data[:cut_index])
+    try:
+        summary_agent = _make_summary_agent(settings)
+        async with summary_agent:
+            result = await summary_agent.run(
+                f"<conversation>\n{conversation_text}\n</conversation>\n\n"
+                + SUMMARIZATION_PROMPT
+            )
+        summary_text = str(result.output).strip()
+        if not summary_text:
+            raise RuntimeError("summarization returned an empty summary")
+    except BaseException as exc:
+        print(
+            f"pm-coder compact skipped: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return history
+    new_history = [_merge_summary_into_first_request(kept[0], summary_text)] + kept[1:]
+    print(
+        f"pm-coder compact: summarized {len(prefix)} older message(s) into the "
+        f"next user turn (context {context_tokens:,} -> ~{estimate_context_tokens(to_jsonable_python(new_history)):,} tokens)",
+        file=sys.stderr,
+        flush=True,
+    )
+    return new_history
+
+
+def _merge_summary_into_first_request(
+    first: Any, summary_text: str
+) -> Any:
+    """Prepend the summary into the first kept user request, keeping the message
+    stream alternating cleanly between user and assistant turns."""
+    parts = list(getattr(first, "parts", None) or [])
+    new_parts: list[Any] = []
+    inserted = False
+    for part in parts:
+        if isinstance(part, UserPromptPart) and not inserted:
+            new_parts.append(
+                UserPromptPart(
+                    content=(
+                        "[Checkpoint summary of the earlier conversation]\n"
+                        f"{summary_text}\n\n\n"
+                        f"{part.content}"
+                    )
+                )
+            )
+            inserted = True
+        else:
+            new_parts.append(part)
+    if not inserted:
+        new_parts.insert(
+            0,
+            UserPromptPart(
+                content=(
+                    "[Checkpoint summary of the earlier conversation]\n"
+                    f"{summary_text}"
+                )
+            ),
+        )
+    return ModelRequest(parts=new_parts)
+
+
 async def _run_agent_turn(
     agent: Agent[Any, str],
     prompt: str,
     message_history: list[Any] | None,
     *,
+    settings: Settings,
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
     request_limit: int | None = None,
     wall_clock_limit: int | None = None,
 ) -> tuple[Any, list[Any], dict[str, Any]]:
     history = list(message_history or [])
+    history = await _maybe_compact_history(agent, settings, history)
     next_prompt = prompt
     used_requests = 0
     total_usage: dict[str, Any] = {}
@@ -1965,6 +2409,11 @@ async def async_run_auto(
     temperature: float = 0.1,
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
     enable_thinking: bool = True,
+    skill: str | None = None,
+    auto_compact: bool = False,
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
+    compact_reserve_tokens: int = DEFAULT_COMPACT_RESERVE_TOKENS,
+    compact_keep_recent_tokens: int = DEFAULT_COMPACT_KEEP_RECENT_TOKENS,
     request_limit: int | None = None,
     wall_clock_limit: int | None = None,
 ) -> AutoResult:
@@ -1993,6 +2442,18 @@ async def async_run_auto(
     ):
         if value is not None:
             argv += [option, str(value)]
+    if skill is not None:
+        argv += ["--skill", skill]
+    if auto_compact:
+        argv.append("--auto-compact")
+    argv += [
+        "--context-window",
+        str(context_window),
+        "--compact-reserve-tokens",
+        str(compact_reserve_tokens),
+        "--compact-keep-recent-tokens",
+        str(compact_keep_recent_tokens),
+    ]
     argv += ["--temperature", str(temperature)]
     if enable_thinking:
         argv.append("--enable-thinking")
@@ -2013,6 +2474,7 @@ async def async_run_auto(
                 agent,
                 prompt,
                 history,
+                settings=settings,
                 max_tokens=settings.max_tokens,
                 request_limit=request_limit,
                 wall_clock_limit=wall_clock_limit,
@@ -2059,6 +2521,11 @@ def run_auto(
     temperature: float = 0.1,
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
     enable_thinking: bool = True,
+    skill: str | None = None,
+    auto_compact: bool = False,
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
+    compact_reserve_tokens: int = DEFAULT_COMPACT_RESERVE_TOKENS,
+    compact_keep_recent_tokens: int = DEFAULT_COMPACT_KEEP_RECENT_TOKENS,
     request_limit: int | None = None,
     wall_clock_limit: int | None = None,
 ) -> dict[str, Any]:
@@ -2086,6 +2553,11 @@ def run_auto(
         "temperature": temperature,
         "max_tokens": max_tokens,
         "enable_thinking": enable_thinking,
+        "skill": skill,
+        "auto_compact": auto_compact,
+        "context_window": context_window,
+        "compact_reserve_tokens": compact_reserve_tokens,
+        "compact_keep_recent_tokens": compact_keep_recent_tokens,
         "request_limit": request_limit,
         "wall_clock_limit": wall_clock_limit,
     }
@@ -2110,18 +2582,32 @@ def run_auto_sync(
 
 def print_startup(settings: Settings, discovery: DiscoveryResult) -> None:
     print(f"\n{APP_NAME}")
-    print(f"  cwd:        {settings.cwd}")
-    print(f"  endpoint:   {settings.base_url}")
-    print(f"  model:      {settings.model}")
-    print(f"  shell:      {settings.shell_kind} ({settings.shell_executable})")
-    print(f"  skills:     {len(discovery.skills)}")
-    print(f"  instructions: {len(discovery.instruction_files)} file(s)")
+    print(f"  cwd:                        {settings.cwd}")
+    print(f"  endpoint:                   {settings.base_url}")
+    print(f"  model:                      {settings.model}")
+    print(f"  shell:                      {settings.shell_kind} ({settings.shell_executable})")
+    print(f"  skills:                     {len(discovery.skills)}")
+    print(f"  instructions:               {len(discovery.instruction_files)} file(s)")
     print(
-        "  MCP servers: "
+        "  MCP servers:                "
         + (", ".join(discovery.mcp_server_names) or "none configured")
     )
+    print(f"  temperature:                {settings.temperature}")
+    print(f"  max tokens:                 {settings.max_tokens}")
+    print(
+        "  selected skill:             "
+        + (discovery.selected_skill.name if discovery.selected_skill else "(none)")
+    )
+    print(f"  auto-compact:               {'on' if settings.auto_compact else 'off'}")
+    if settings.auto_compact:
+        print(
+            f"  context window / reserve / keep-recent: "
+            f"{settings.context_window:,} / "
+            f"{settings.compact_reserve_tokens:,} / "
+            f"{settings.compact_keep_recent_tokens:,}"
+        )
     for error in discovery.skill_errors:
-        print(f"  skill warning: {error}")
+        print(f"  skill warning:              {error}")
 
 
 def read_user_prompt() -> str | None:
@@ -2174,6 +2660,7 @@ async def interactive_loop(
                 agent,
                 prompt,
                 message_history,
+                settings=settings,
                 max_tokens=settings.max_tokens,
             )
             message_history = result.all_messages()
@@ -2221,6 +2708,11 @@ async def async_main(argv: list[str] | None = None) -> None:
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             enable_thinking=args.enable_thinking,
+            skill=args.skill,
+            auto_compact=args.auto_compact,
+            context_window=args.context_window,
+            compact_reserve_tokens=args.compact_reserve_tokens,
+            compact_keep_recent_tokens=args.compact_keep_recent_tokens,
             request_limit=args.request_limit,
             wall_clock_limit=args.wall_clock_limit,
         )
