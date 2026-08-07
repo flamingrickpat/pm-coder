@@ -75,8 +75,8 @@ variable when the flag is not passed.
 | `--enable-thinking` / `--disable-thinking` | enabled | &mdash; | Allow or disable provider-specific long-form reasoning. |
 | `--prompt-file PATH` | &mdash; | &mdash; | Prompt source file. With `--artifact-dir` enables legacy one-shot/heartbeat mode. |
 | `--artifact-dir DIR` | &mdash; | &mdash; | Legacy one-shot output directory (with `--prompt-file`, `--request-limit`, `--wall-clock-limit`). |
-| `--request-limit N` | unlimited | &mdash; | Maximum model requests for one turn. |
-| `--wall-clock-limit SECS` | unlimited | &mdash; | Maximum wall-clock time for one turn. |
+| `--request-limit N` | `0` (unlimited) | &mdash; | Maximum model requests for one turn, counting main-agent **and** compaction-summary calls. `0` = unlimited. |
+| `--wall-clock-limit SECS` | `0` (unlimited) | &mdash; | Maximum wall-clock time for one turn. `0` = unlimited. |
 
 ### `--auto-compact` details
 

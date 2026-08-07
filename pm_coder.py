@@ -285,6 +285,10 @@ DEFAULT_MAX_PROJECT_INSTRUCTIONS_CHARS: int | None = None
 DEFAULT_MAX_TOKENS: int | None = 8_192
 DEFAULT_LOG_ROOT = Path("~/.pm/pm-coder").expanduser()
 RECOVERY_TOOL_CALL_TOKEN_TARGET = 4_000
+# How many times one turn may compact-and-continue after hitting the model
+# context window before giving up (each compaction buys back a full window's
+# worth of headroom, so a handful is generous).
+MAX_COMPACT_RECOVERIES_PER_TURN = 6
 # Context compaction defaults mirror the upstream pi coding agent so a tuned
 # setup behaves identically out of the box. The context window itself is the
 # model's, so it is separate and configurable.
@@ -772,8 +776,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--prompt-file")
     parser.add_argument("--artifact-dir")
-    parser.add_argument("--request-limit", type=int)
-    parser.add_argument("--wall-clock-limit", type=int)
+    parser.add_argument(
+        "--request-limit",
+        type=int,
+        default=0,
+        help=(
+            "Maximum model requests for one turn, counting main-agent and "
+            "compaction-summary calls. 0 (the default) means unlimited."
+        ),
+    )
+    parser.add_argument(
+        "--wall-clock-limit",
+        type=int,
+        default=0,
+        help=(
+            "Maximum wall-clock seconds for one turn. 0 (the default) means "
+            "unlimited."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1346,8 +1366,10 @@ def one_shot_options(args: argparse.Namespace) -> OneShotOptions | None:
     values = (
         args.prompt_file,
         args.artifact_dir,
-        args.request_limit,
-        args.wall_clock_limit,
+        # 0 means "not set" (unlimited) for the rate limits, matching the new
+        # CLI defaults, so they cannot satisfy the one-shot validation below.
+        None if args.request_limit == 0 else args.request_limit,
+        None if args.wall_clock_limit == 0 else args.wall_clock_limit,
     )
     if not any(value is not None for value in values):
         return None
@@ -1569,7 +1591,10 @@ def _context_limit_failure(exc: BaseException) -> str | None:
         "exceeds the context",
         "exceeded the context",
         "prompt is too long",
-        "request exceeds the available context",
+        "available context",
+        "context size",
+        "context length",
+        "reduce prompt",
         "n_ctx",
     )
     if not any(marker in lowered for marker in markers):
@@ -1689,6 +1714,16 @@ def _merge_usage(total: dict[str, Any], addition: Mapping[str, Any]) -> None:
             total[key] = int(total.get(key, 0) or 0) + value
         elif key not in total:
             total[key] = value
+
+
+def _context_full_recovery_prompt() -> str:
+    return (
+        "The previous conversation reached the model context window and the "
+        "earlier part was summarized into the checkpoint message above. "
+        "Continue the CURRENT task from that checkpoint. Do NOT restart from "
+        "scratch. Keep making concrete progress on the original goal, verify "
+        "with fresh state, and return the required result when you are done."
+    )
 
 
 def _response_limit_feedback(max_tokens: int | None) -> str:
@@ -2123,6 +2158,10 @@ def _find_cut_index(
                 if candidate >= i:
                     cut_index = candidate
                     break
+            else:
+                # Budget was reached past the last user turn (trailing tool
+                # exchanges); fall back to the most recent user turn.
+                cut_index = cut_points[-1]
             break
     return cut_index
 
@@ -2169,29 +2208,32 @@ async def _maybe_compact_history(
     agent: Agent[Any, str],
     settings: Settings,
     history: list[Any],
-) -> list[Any]:
-    """Summarize older turns when the context grows large; return new history.
+) -> tuple[list[Any], int]:
+    """Summarize older turns when the context grows large.
 
-    A failed summarization never breaks the session: it logs a warning and
-    returns the original history unchanged.
+    Returns ``(new_history, summary_requests)`` where ``summary_requests`` is
+    the number of model requests the summary pass used (0 when no compaction
+    happened). A failed summarization never breaks the session: it logs a
+    warning and returns the original history unchanged with a zero count.
     """
     if not settings.auto_compact or not history:
-        return history
+        return history, 0
     data = to_jsonable_python(history)
     if not isinstance(data, list):
-        return history
+        return history, 0
     context_tokens = estimate_context_tokens(data)
     threshold = settings.context_window - settings.compact_reserve_tokens
     if context_tokens <= threshold:
-        return history
+        return history, 0
     cut_index = _find_cut_index(data, settings.compact_keep_recent_tokens)
     if cut_index is None or cut_index <= 0:
-        return history
+        return history, 0
     prefix = history[:cut_index]
     kept = history[cut_index:]
     if not kept:
-        return history
+        return history, 0
     conversation_text = _serialize_conversation(data[:cut_index])
+    summary_requests = 0
     try:
         summary_agent = _make_summary_agent(settings)
         async with summary_agent:
@@ -2199,6 +2241,7 @@ async def _maybe_compact_history(
                 f"<conversation>\n{conversation_text}\n</conversation>\n\n"
                 + SUMMARIZATION_PROMPT
             )
+        summary_requests = int(result.usage.requests)
         summary_text = str(result.output).strip()
         if not summary_text:
             raise RuntimeError("summarization returned an empty summary")
@@ -2208,7 +2251,7 @@ async def _maybe_compact_history(
             file=sys.stderr,
             flush=True,
         )
-        return history
+        return history, 0
     new_history = [_merge_summary_into_first_request(kept[0], summary_text)] + kept[1:]
     print(
         f"pm-coder compact: summarized {len(prefix)} older message(s) into the "
@@ -2216,7 +2259,96 @@ async def _maybe_compact_history(
         file=sys.stderr,
         flush=True,
     )
-    return new_history
+    return new_history, summary_requests
+
+
+async def _force_compact(
+    agent: Agent[Any, str], settings: Settings, messages: list[Any]
+) -> tuple[list[Any] | None, int]:
+    """Summarize the entire given messages into a single user-role checkpoint.
+
+    Used on a mid-turn context-limit where clean turn boundaries do not exist
+    (a single ``agent.run`` turn is one user prompt plus a chain of tool
+    exchanges, so cut-point compaction finds nothing to cut). Returning the
+    whole accumulation as one summary reclaims maximum headroom so the task
+    can continue from the checkpoint. Returns ``(checkpoint, requests)``.
+    """
+    if not messages:
+        return None, 0
+    data = to_jsonable_python(messages)
+    if not isinstance(data, list) or not data:
+        return None, 0
+    conversation_text = _serialize_conversation(data)
+    requests = 0
+    try:
+        summary_agent = _make_summary_agent(settings)
+        async with summary_agent:
+            result = await summary_agent.run(
+                f"<conversation>\n{conversation_text}\n</conversation>\n\n"
+                + SUMMARIZATION_PROMPT
+            )
+        requests = int(result.usage.requests)
+        summary_text = str(result.output).strip()
+        if not summary_text:
+            return None, requests
+    except BaseException as exc:
+        print(
+            f"pm-coder recovery: force-compact skipped: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None, 0
+    checkpoint = ModelRequest(
+        parts=[
+            UserPromptPart(
+                content=(
+                    "[Checkpoint summary of the conversation so far]\n"
+                    f"{summary_text}"
+                )
+            )
+        ]
+    )
+    return [checkpoint], requests
+
+
+async def _compact_for_recovery(
+    agent: Agent[Any, str],
+    settings: Settings,
+    safe_history: list[Any],
+    next_prompt: str,
+    compact_recoveries: int,
+    detail: str,
+) -> tuple[list[Any], str, int, int] | None:
+    """Compress history after a context-limit so the turn can continue.
+
+    First tries the normal cut-point compaction (keeps recent turns verbatim).
+    When that cannot reclaim anything because the long turn has no clean user
+    boundaries, it falls back to force-compacting the whole accumulation into
+    one checkpoint. Returns ``(new_history, next_prompt, compact_recoveries,
+    extra_requests)`` on success, or ``None`` when nothing can be reclaimed or
+    the per-turn cap of compaction recoveries has been reached; the caller
+    then raises. ``extra_requests`` is the number of model requests the
+    summary pass consumed, so it counts toward the request budget.
+    """
+    if compact_recoveries >= MAX_COMPACT_RECOVERIES_PER_TURN or not safe_history:
+        return None
+    compacted, requests = await _maybe_compact_history(agent, settings, safe_history)
+    if len(compacted) < len(safe_history):
+        return (
+            compacted,
+            _context_full_recovery_prompt(),
+            compact_recoveries + 1,
+            requests,
+        )
+    forced, force_requests = await _force_compact(agent, settings, safe_history)
+    if forced is None or len(forced) >= len(safe_history):
+        return None
+    return (
+        forced,
+        _context_full_recovery_prompt(),
+        compact_recoveries + 1,
+        force_requests,
+    )
 
 
 def _merge_summary_into_first_request(
@@ -2264,12 +2396,18 @@ async def _run_agent_turn(
     request_limit: int | None = None,
     wall_clock_limit: int | None = None,
 ) -> tuple[Any, list[Any], dict[str, Any]]:
+    # 0 (or omitted) means unlimited for both budget knobs.
+    request_limit = request_limit if request_limit else None
+    wall_clock_limit = wall_clock_limit if wall_clock_limit else None
     history = list(message_history or [])
-    history = await _maybe_compact_history(agent, settings, history)
+    history, compact_requests = await _maybe_compact_history(
+        agent, settings, history
+    )
     next_prompt = prompt
-    used_requests = 0
+    used_requests = compact_requests
     total_usage: dict[str, Any] = {}
     transient_failures = 0
+    compact_recoveries = 0
     deadline = (
         time.monotonic() + wall_clock_limit
         if wall_clock_limit is not None
@@ -2330,6 +2468,25 @@ async def _run_agent_turn(
             if boundary_failure is not None:
                 error_class, detail = boundary_failure
                 if error_class is ContextLimitReachedError:
+                    recovery = await _compact_for_recovery(
+                        agent,
+                        settings,
+                        safe_history,
+                        next_prompt,
+                        compact_recoveries,
+                        detail,
+                    )
+                    if recovery is not None:
+                        history, next_prompt, compact_recoveries, extra = recovery
+                        used_requests += completed_requests + extra
+                        transient_failures = 0
+                        print(
+                            "pm-coder recovery: compacted context after limit "
+                            f"({detail})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
                     raise error_class(detail) from exc
                 used_requests += completed_requests
                 history = safe_history
@@ -2339,6 +2496,25 @@ async def _run_agent_turn(
                 continue
             context_failure = _context_limit_failure(exc)
             if context_failure is not None:
+                recovery = await _compact_for_recovery(
+                    agent,
+                    settings,
+                    safe_history,
+                    next_prompt,
+                    compact_recoveries,
+                    context_failure,
+                )
+                if recovery is not None:
+                    history, next_prompt, compact_recoveries, extra = recovery
+                    used_requests += completed_requests + extra
+                    transient_failures = 0
+                    print(
+                        "pm-coder recovery: compacted context after limit "
+                        f"({context_failure})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 raise ContextLimitReachedError(context_failure) from exc
             if _is_transient_endpoint_failure(exc):
                 used_requests += completed_requests
@@ -2381,6 +2557,29 @@ async def _run_agent_turn(
         _merge_usage(total_usage, result_usage)
         used_requests += int(result_usage.get("requests", 0) or 0)
         if error_class is ContextLimitReachedError:
+            safe_result = _safe_recovery_history(
+                result.all_messages(),
+                prefix_count=len(history),
+            )
+            recovery = await _compact_for_recovery(
+                agent,
+                settings,
+                safe_result,
+                next_prompt,
+                compact_recoveries,
+                detail,
+            )
+            if recovery is not None:
+                history, next_prompt, compact_recoveries, extra = recovery
+                used_requests += extra
+                transient_failures = 0
+                print(
+                    "pm-coder recovery: compacted context after limit "
+                    f"({detail})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
             raise error_class(detail)
         history = _safe_recovery_history(
             result.all_messages(),
