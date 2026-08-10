@@ -902,6 +902,7 @@ def skill_roots(cwd: Path) -> list[Path]:
             Path.home() / ".agents" / "skills",
             Path.home() / ".pi" / "agent" / "skills",
             Path.home() / ".codex" / "skills",
+            Path.home() / ".pm" / "skills",
         ]
     )
     unique: list[Path] = []
@@ -1239,11 +1240,38 @@ def _find_skill(skills: list[Skill], name: str) -> Skill | None:
     return None
 
 
+def _find_skill_by_exact_path(skills: list[Skill], reference: str) -> Skill | None:
+    """Select a skill by an exact on-disk SKILL.md path.
+
+    Short names keep using ``_find_skill``. Callers that already resolved a
+    skill file (for example the loop kernel) can pass that exact path and get
+    the same skill object the discovery index would have produced.
+    """
+    if "\n" in reference or not any(c in reference for c in "/\\"):
+        return None
+    try:
+        candidate = Path(reference).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if not candidate.is_file() or candidate.name != "SKILL.md":
+        return None
+    for skill in skills:
+        if skill.skill_file == candidate:
+            return skill
+    try:
+        parsed = parse_skill(candidate, priority=0)
+    except (OSError, ValueError):
+        return None
+    return parsed
+
+
 def discover_workspace(settings: Settings) -> DiscoveryResult:
     skills, skill_errors = load_skills(settings.cwd)
     selected_skill: Skill | None = None
     if settings.skill:
-        selected_skill = _find_skill(skills, settings.skill)
+        selected_skill = _find_skill_by_exact_path(skills, settings.skill)
+        if selected_skill is None:
+            selected_skill = _find_skill(skills, settings.skill)
         if selected_skill is None:
             available = ", ".join(sorted(s.name for s in skills)) or "(none)"
             raise FileNotFoundError(
