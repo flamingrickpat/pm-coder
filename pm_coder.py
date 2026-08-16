@@ -24,7 +24,7 @@ import traceback
 import urllib.request
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from io import StringIO
@@ -48,8 +48,13 @@ from pydantic_ai.mcp import load_mcp_toolsets
 from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
+    TextPartDelta,
+    ThinkingPartDelta,
+    ToolCallPartDelta,
     UserPromptPart,
 )
+from pydantic_ai.models import StreamedResponse
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.models.openai import (
     OpenAIChatModel,
     OpenAIChatModelSettings,
@@ -326,6 +331,7 @@ class Settings(StrictModel):
     disable_thinking: bool = False
     skill: str | None = None
     auto_compact: bool = False
+    verbose: bool = False
     context_window: int = DEFAULT_CONTEXT_WINDOW
     compact_reserve_tokens: int = DEFAULT_COMPACT_RESERVE_TOKENS
     compact_keep_recent_tokens: int = DEFAULT_COMPACT_KEEP_RECENT_TOKENS
@@ -711,6 +717,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "exceeds --context-window minus --compact-reserve-tokens, summarize "
             "the older turns with a short LLM pass and keep only the most "
             "recent ~--compact-keep-recent-tokens of context."
+        ),
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help=(
+            "Debugging mode: print the raw model response to stdout as it "
+            "streams in (thinking, text, and tool-call arguments exactly as "
+            "they arrive), with request/response markers and usage. Also "
+            "prints auto-compaction triggers and summaries. Useful when a "
+            "turn hangs or retries, because the first message of a session "
+            "is not persisted until the turn completes."
         ),
     )
     parser.add_argument(
@@ -1221,6 +1240,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
         disable_thinking=not args.enable_thinking,
         skill=args.skill,
         auto_compact=args.auto_compact,
+        verbose=args.verbose,
         context_window=args.context_window or DEFAULT_CONTEXT_WINDOW,
         compact_reserve_tokens=(
             args.compact_reserve_tokens or DEFAULT_COMPACT_RESERVE_TOKENS
@@ -1292,22 +1312,295 @@ def discover_workspace(settings: Settings) -> DiscoveryResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# Verbose mode (-v / --verbose).
+#
+# VerboseModel wraps the model so the raw response stream is printed to
+# stdout while it happens, before any of it is validated, retried, or
+# persisted. That is what "what is really coming back from the model" looks
+# like: provider part events exactly as pydantic-ai surfaces them. Because
+# the wrap happens at the model, every caller gets it for free: the main
+# agent, the recovery retries, and the auto-compaction summary pass.
+
+
+class _VerbosePrinter:
+    """Prints one raw model response to a stream while it streams in."""
+
+    def __init__(self, stream: Any, label: str | None = None) -> None:
+        self.stream = stream
+        self.label = label
+        self._raw_active = False  # raw content written without a trailing \n
+        self.saw_part = False  # at least one part_start event observed
+
+    def _prefix(self) -> str:
+        if self.label:
+            return f"pm-coder verbose {self.label}: "
+        return "pm-coder verbose: "
+
+    def _newline(self) -> None:
+        if self._raw_active:
+            print("", file=self.stream, flush=True)
+            self._raw_active = False
+
+    def _write(self, text: str, *, raw: bool = False) -> None:
+        if raw:
+            # Raw chunks must stay contiguous (no newline) so the generated
+            # text/JSON reads exactly as the model emitted it.
+            self._raw_active = True
+            self.stream.write(text)
+            self.stream.flush()
+        else:
+            print(text, file=self.stream, flush=True)
+
+    def request_banner(
+        self, model_name: str, message_count: int, tool_count: int
+    ) -> None:
+        self._newline()
+        self._write(
+            f"{self._prefix()}request: model={model_name} "
+            f"messages={message_count} tools={tool_count}"
+        )
+
+    def handle(self, event: Any) -> None:
+        """Print one model-response stream event verbatim-ish."""
+        kind = getattr(event, "event_kind", None)
+        if kind == "part_start":
+            part = event.part
+            part_kind = getattr(part, "part_kind", "")
+            self.saw_part = True
+            self._newline()
+            if part_kind == "text":
+                self._write(f"{self._prefix()}assistant text:")
+                # The starting part can already carry content (non-streamed
+                # providers and first chunks); print it so nothing is lost.
+                self._raw_content(getattr(part, "content", None))
+            elif part_kind == "thinking":
+                self._write(f"{self._prefix()}assistant thinking:")
+                self._raw_content(getattr(part, "content", None))
+            elif part_kind in {"tool-call", "builtin-tool-call"}:
+                self._write(
+                    f"{self._prefix()}tool call: {part.tool_name or '?'}"
+                )
+                self._raw_content(getattr(part, "args", None))
+            else:
+                self._write(f"{self._prefix()}{part_kind or 'unknown'} part started")
+        elif kind == "part_delta":
+            self._part_delta(event.delta)
+        elif kind == "part_end":
+            self._newline()
+
+    def _raw_content(self, value: Any) -> None:
+        """Print a part's starting content verbatim (empty values are a no-op)."""
+        if not value:
+            return
+        if isinstance(value, dict):
+            value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        self._write(str(value), raw=True)
+
+    def print_parts(self, response: Any) -> None:
+        """Render the final parts when the stream surfaced no part events.
+
+        Non-streamed providers hand back a completed response whose stream
+        yields no events at all; without this the verbose mode would show a
+        request banner and a completion line but none of the raw content.
+        """
+        parts = getattr(response, "parts", None) or []
+        for part in parts:
+            part_kind = getattr(part, "part_kind", "")
+            self._newline()
+            if part_kind == "text":
+                self._write(f"{self._prefix()}assistant text:")
+                self._raw_content(getattr(part, "content", None))
+            elif part_kind == "thinking":
+                self._write(f"{self._prefix()}assistant thinking:")
+                self._raw_content(getattr(part, "content", None))
+            elif part_kind in {"tool-call", "builtin-tool-call"}:
+                self._write(
+                    f"{self._prefix()}tool call: "
+                    f"{getattr(part, 'tool_name', '') or '?'}"
+                )
+                self._raw_content(getattr(part, "args", None))
+            else:
+                self._write(
+                    f"{self._prefix()}{part_kind or 'unknown'} part"
+                )
+
+    def _part_delta(self, delta: Any) -> None:
+        if isinstance(delta, TextPartDelta | ThinkingPartDelta):
+            if delta.content_delta:
+                self._write(delta.content_delta, raw=True)
+        elif isinstance(delta, ToolCallPartDelta):
+            if delta.tool_name_delta:
+                self._write(delta.tool_name_delta, raw=True)
+            args_delta = delta.args_delta
+            if args_delta:
+                if isinstance(args_delta, dict):
+                    args_delta = json.dumps(
+                        args_delta, ensure_ascii=False, separators=(",", ":")
+                    )
+                self._write(str(args_delta), raw=True)
+        else:
+            self._write(f"{self._prefix()}(unrecognized delta {type(delta).__name__})")
+
+    def response_done(self, response: Any) -> None:
+        self._newline()
+        usage = getattr(response, "usage", None)
+        usage_text = ""
+        if usage is not None:
+            usage_text = (
+                f" usage: input={getattr(usage, 'input_tokens', 0)} "
+                f"output={getattr(usage, 'output_tokens', 0)}"
+            )
+        self._write(
+            f"{self._prefix()}response complete: "
+            f"finish_reason={getattr(response, 'finish_reason', None) or '?'}"
+            f"{usage_text}"
+        )
+
+    def stream_error(self, exc: BaseException) -> None:
+        self._newline()
+        print(
+            f"{self._prefix()}stream error: "
+            f"{type(exc).__name__}: {str(exc)[:400]}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+class VerboseStreamedResponse(StreamedResponse):
+    """Pass-through :class:`StreamedResponse` that prints every raw event.
+
+    The event stream is the provider's, untouched: events are yielded to
+    pydantic-ai exactly as received, after being printed. ``get()``,
+    ``usage``, and the stream metadata all delegate to the inner stream,
+    so the agent loop, usage accounting, and recovery logic see the same
+    state they would without verbose mode.
+    """
+
+    def __init__(self, inner: StreamedResponse, printer: _VerbosePrinter) -> None:
+        super().__init__(inner.model_request_parameters)
+        self._inner = inner
+        self._printer = printer
+
+    def __aiter__(self) -> Any:
+        inner = self._inner
+        printer = self._printer
+
+        async def tee() -> Any:
+            try:
+                async for event in inner:
+                    printer.handle(event)
+                    if event.event_kind == "final_result":
+                        self.final_result_event = event
+                    yield event
+                if not printer.saw_part:
+                    printer.print_parts(inner.get())
+                printer.response_done(inner.get())
+            except BaseException as exc:
+                printer.stream_error(exc)
+                raise
+
+        return tee()
+
+    async def _get_event_iterator(self) -> Any:
+        # Never used: __aiter__ is overridden above and consumes the inner
+        # stream, whose own __aiter__ applies the part-end/cancel plumbing.
+        raise NotImplementedError
+
+    async def close_stream(self) -> None:
+        await self._inner.close_stream()
+
+    def get(self) -> Any:
+        return self._inner.get()
+
+    def time_to_first_chunk(self, request_start: float) -> float | None:
+        return self._inner.time_to_first_chunk(request_start)
+
+    @property
+    def usage(self) -> Any:
+        return self._inner.usage
+
+    @property
+    def model_name(self) -> str:
+        return self._inner.model_name
+
+    @property
+    def provider_name(self) -> str | None:
+        return self._inner.provider_name
+
+    @property
+    def provider_url(self) -> str | None:
+        return self._inner.provider_url
+
+    @property
+    def timestamp(self) -> datetime:
+        return self._inner.timestamp
+
+
+class VerboseModel(WrapperModel):
+    """A :class:`WrapperModel` that tees raw model output to a stream."""
+
+    def __init__(
+        self,
+        wrapped: Any,
+        *,
+        stream: Any = None,
+        label: str | None = None,
+    ) -> None:
+        super().__init__(wrapped)
+        self.stream = stream if stream is not None else sys.stdout
+        # ``label`` is an inherited read-only property on Model, so store the
+        # verbose tag under its own name.
+        self.verbose_label = label
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[Any],
+        model_settings: Any,
+        model_request_parameters: Any,
+        run_context: Any = None,
+    ) -> Any:
+        async with self.wrapped.request_stream(
+            messages, model_settings, model_request_parameters, run_context
+        ) as inner:
+            printer = _VerbosePrinter(self.stream, self.verbose_label)
+            printer.request_banner(
+                inner.model_name,
+                len(messages),
+                len(model_request_parameters.function_tools),
+            )
+            yield VerboseStreamedResponse(inner, printer)
+
+    async def request(
+        self,
+        messages: list[Any],
+        model_settings: Any,
+        model_request_parameters: Any,
+    ) -> Any:
+        response = await self.wrapped.request(
+            messages, model_settings, model_request_parameters
+        )
+        printer = _VerbosePrinter(self.stream, self.verbose_label)
+        printer.request_banner(
+            getattr(response, "model_name", "?"),
+            len(messages),
+            len(model_request_parameters.function_tools),
+        )
+        # The plain request path has no part events, so render the finished
+        # parts: that is the raw generated content for this call.
+        printer.print_parts(response)
+        printer.response_done(response)
+        return response
+
+
 def build_agent(
     settings: Settings,
     discovery: DiscoveryResult,
 ) -> Agent[Any, str]:
-    profile = OpenAIModelProfile(
-        openai_supports_strict_tool_definition=False,
-        openai_chat_supports_multiple_system_messages=False,
-    )
-    model = OpenAIChatModel(
-        settings.model,
-        provider=OpenAIProvider(
-            base_url=settings.base_url,
-            api_key=settings.api_key,
-        ),
-        profile=profile,
-    )
+    model = _make_model(settings)
+    if settings.verbose:
+        model = VerboseModel(model, label="agent")
     toolsets = (
         load_mcp_toolsets(settings.mcp_config)
         if settings.mcp_config is not None
@@ -1364,8 +1657,11 @@ def _make_summary_agent(settings: Settings) -> Agent[Any, str]:
         8_192,
         max(1_024, int(settings.compact_reserve_tokens * 0.8)),
     )
+    model = _make_model(settings)
+    if settings.verbose:
+        model = VerboseModel(model, label="compact")
     return Agent(
-        model=_make_model(settings),
+        model=model,
         system_prompt=(
             "You summarize a coding-agent conversation into a concise, "
             "structured checkpoint summary that another LLM will use to "
@@ -2260,6 +2556,14 @@ async def _maybe_compact_history(
     kept = history[cut_index:]
     if not kept:
         return history, 0
+    if settings.verbose:
+        print(
+            f"pm-coder verbose compact: context {context_tokens:,} tokens "
+            f"exceeds threshold {threshold:,}; summarizing the first "
+            f"{len(prefix)} message(s) and keeping {len(kept)} message(s) verbatim",
+            file=sys.stdout,
+            flush=True,
+        )
     conversation_text = _serialize_conversation(data[:cut_index])
     summary_requests = 0
     try:
@@ -2280,6 +2584,13 @@ async def _maybe_compact_history(
             flush=True,
         )
         return history, 0
+    if settings.verbose:
+        print(
+            "pm-coder verbose compact: summary:\n"
+            f"{summary_text}\n",
+            file=sys.stdout,
+            flush=True,
+        )
     new_history = [_merge_summary_into_first_request(kept[0], summary_text)] + kept[1:]
     print(
         f"pm-coder compact: summarized {len(prefix)} older message(s) into the "
@@ -2306,6 +2617,13 @@ async def _force_compact(
     data = to_jsonable_python(messages)
     if not isinstance(data, list) or not data:
         return None, 0
+    if settings.verbose:
+        print(
+            f"pm-coder verbose recovery: force-compacting {len(messages)} "
+            "message(s) into a single checkpoint",
+            file=sys.stdout,
+            flush=True,
+        )
     conversation_text = _serialize_conversation(data)
     requests = 0
     try:
@@ -2326,6 +2644,13 @@ async def _force_compact(
             flush=True,
         )
         return None, 0
+    if settings.verbose:
+        print(
+            "pm-coder verbose compact: summary:\n"
+            f"{summary_text}\n",
+            file=sys.stdout,
+            flush=True,
+        )
     checkpoint = ModelRequest(
         parts=[
             UserPromptPart(
@@ -2638,6 +2963,7 @@ async def async_run_auto(
     enable_thinking: bool = True,
     skill: str | None = None,
     auto_compact: bool = False,
+    verbose: bool = False,
     context_window: int = DEFAULT_CONTEXT_WINDOW,
     compact_reserve_tokens: int = DEFAULT_COMPACT_RESERVE_TOKENS,
     compact_keep_recent_tokens: int = DEFAULT_COMPACT_KEEP_RECENT_TOKENS,
@@ -2673,7 +2999,9 @@ async def async_run_auto(
         argv += ["--skill", skill]
     if auto_compact:
         argv.append("--auto-compact")
-    argv += [
+    if verbose:
+        argv.append("--verbose")
+    argv +=[
         "--context-window",
         str(context_window),
         "--compact-reserve-tokens",
@@ -2750,6 +3078,7 @@ def run_auto(
     enable_thinking: bool = True,
     skill: str | None = None,
     auto_compact: bool = False,
+    verbose: bool = False,
     context_window: int = DEFAULT_CONTEXT_WINDOW,
     compact_reserve_tokens: int = DEFAULT_COMPACT_RESERVE_TOKENS,
     compact_keep_recent_tokens: int = DEFAULT_COMPACT_KEEP_RECENT_TOKENS,
@@ -2782,6 +3111,7 @@ def run_auto(
         "enable_thinking": enable_thinking,
         "skill": skill,
         "auto_compact": auto_compact,
+        "verbose": verbose,
         "context_window": context_window,
         "compact_reserve_tokens": compact_reserve_tokens,
         "compact_keep_recent_tokens": compact_keep_recent_tokens,
@@ -2826,6 +3156,7 @@ def print_startup(settings: Settings, discovery: DiscoveryResult) -> None:
         + (discovery.selected_skill.name if discovery.selected_skill else "(none)")
     )
     print(f"  auto-compact:               {'on' if settings.auto_compact else 'off'}")
+    print(f"  verbose:                    {'on' if settings.verbose else 'off'}")
     if settings.auto_compact:
         print(
             f"  context window / reserve / keep-recent: "
@@ -2937,6 +3268,7 @@ async def async_main(argv: list[str] | None = None) -> None:
             enable_thinking=args.enable_thinking,
             skill=args.skill,
             auto_compact=args.auto_compact,
+            verbose=args.verbose,
             context_window=args.context_window,
             compact_reserve_tokens=args.compact_reserve_tokens,
             compact_keep_recent_tokens=args.compact_keep_recent_tokens,

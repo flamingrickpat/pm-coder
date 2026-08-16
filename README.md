@@ -77,6 +77,7 @@ variable when the flag is not passed.
 | `--artifact-dir DIR` | &mdash; | &mdash; | Legacy one-shot output directory (with `--prompt-file`, `--request-limit`, `--wall-clock-limit`). |
 | `--request-limit N` | `0` (unlimited) | &mdash; | Maximum model requests for one turn, counting main-agent **and** compaction-summary calls. `0` = unlimited. |
 | `--wall-clock-limit SECS` | `0` (unlimited) | &mdash; | Maximum wall-clock time for one turn. `0` = unlimited. |
+| `-v` / `--verbose` | off | &mdash; | Debugging mode: print the raw model generation to stdout as it happens (thinking, text, and tool-call arguments exactly as they arrive), plus request/response markers and usage, and the auto-compaction trigger and summary. Useful for diagnosing hangs, retries, and truncated responses before anything is persisted. |
 
 ### `--auto-compact` details
 
@@ -100,6 +101,10 @@ Auto mode writes one JSON object to stdout:
 ```json
 {"response":"...","run_id":"2026-07-31_19-00-00_C_source_project","duration_seconds":12.34,"tokens_used":{"requests":1,"input_tokens":123,"output_tokens":45,"total_tokens":168}}
 ```
+
+With `--verbose`, the raw model stream is also printed to stdout before this
+line (one marker per model request, then the generated content as it arrives).
+Pipe stdout elsewhere if the extra output breaks your consumer.
 
 Sessions are stored in `~/.pm/pm-coder/<run_id>/`. The `messages.json` file
 contains Pydantic AI's structured model messages, not a summary or a second
@@ -180,9 +185,10 @@ Use `async_run_auto` from an existing asyncio application.
 `run_auto` is also synchronous; `run_auto_sync` is provided as an explicit
 name for callers that want to make the threading boundary clear. Passing
 `auto_compact=True`, `skill="..."`, `context_window=...`,
-`compact_reserve_tokens=...`, and `compact_keep_recent_tokens=...` to
-`run_auto` / `run_auto_sync` enables the same behaviors as the matching CLI
-flags.
+`compact_reserve_tokens=...`, `compact_keep_recent_tokens=...`, and
+`verbose=True` to `run_auto` / `run_auto_sync` enables the same behaviors as
+the matching CLI flags (`verbose=True` prints the raw model stream to
+`sys.stdout` as it happens).
 
 Asyncio is fully opt-in for callers. `run_auto` and `run_auto_sync` run the
 whole session (including any auto-compaction) inside a loop they own and
