@@ -212,7 +212,7 @@ def test_verbose_streams_raw_model_output_to_stdout(
     assert result.response == "mock response"
     dumped = capsys.readouterr().out
     assert "pm-coder verbose agent: request: model=mock-model" in dumped
-    assert "messages=1 tools=1" in dumped
+    assert "messages=1 tools=2" in dumped
     # The raw generated text must be visible on stdout even though this is
     # the very first message of the session.
     assert "mock response" in dumped

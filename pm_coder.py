@@ -35,6 +35,7 @@ from xml.sax.saxutils import escape, quoteattr
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_ai import (
     Agent,
+    RunContext,
     Tool,
     UsageLimits,
     capture_run_messages,
@@ -42,15 +43,18 @@ from pydantic_ai import (
 from pydantic_ai.exceptions import (
     ModelAPIError,
     ModelHTTPError,
+    RunCancelled,
     UsageLimitExceeded,
 )
-from pydantic_ai.mcp import load_mcp_toolsets
+from pydantic_ai.mcp import MCPToolset, load_mcp_toolsets
 from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     TextPartDelta,
     ThinkingPartDelta,
+    ToolCallPart,
     ToolCallPartDelta,
+    ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models import StreamedResponse
@@ -523,6 +527,63 @@ class DiscoveryResult:
     project_instructions: str
     mcp_server_names: list[str]
     selected_skill: Skill | None
+
+
+MCP_CONNECT_TIMEOUT = 15.0
+MCP_INIT_TIMEOUT = 10.0
+MCP_READ_TIMEOUT = 60.0
+MAX_MCP_REBUILDS = 10
+
+
+class MCPRegistry:
+    """MCP servers connected at runtime by the ``mcp_connect`` tool.
+
+    The host session reads this registry to rebuild the agent with the new
+    servers registered natively, exactly as if they had been configured at
+    startup. ``new_connections`` lists URLs added since the last rebuild so
+    the host knows when a rebuild is warranted.
+    """
+
+    def __init__(self) -> None:
+        self._toolsets: dict[str, MCPToolset[Any]] = {}
+        self._descriptions: dict[str, str] = {}
+        self._added: set[str] = set()
+
+    def urls(self) -> set[str]:
+        """URLs of every server connected so far."""
+        return set(self._toolsets)
+
+    def toolsets(self) -> list[MCPToolset[Any]]:
+        """All connected toolsets, in connection order."""
+        return list(self._toolsets.values())
+
+    def add(
+        self,
+        url: str,
+        toolset: MCPToolset[Any],
+        *,
+        server_name: str,
+        server_version: str,
+        tool_names: list[str],
+    ) -> None:
+        self._toolsets[url] = toolset
+        detail = server_name or url
+        if server_version:
+            detail = f"{detail} ({server_version})"
+        tools = ", ".join(tool_names) if tool_names else "(no tools advertised)"
+        self._descriptions[url] = f"{detail} at {url} \u2014 {tools}"
+        self._added.add(url)
+
+    def new_connections(self) -> list[str]:
+        """URLs connected since the last ``mark_built`` (sorted)."""
+        return sorted(self._added)
+
+    def mark_built(self) -> None:
+        """Clear the pending-connection set after a rebuild."""
+        self._added.clear()
+
+    def describe(self, url: str) -> str:
+        return self._descriptions.get(url, url)
 
 
 class ShellBackend(ABC):
@@ -1152,6 +1213,153 @@ def make_shell_tool(settings: Settings) -> Tool[Any]:
     )
 
 
+def _mcp_error_text(exc: BaseException) -> str:
+    """Short readable description of an MCP connection failure."""
+    current = exc
+    while isinstance(current, BaseExceptionGroup):
+        children = getattr(current, "exceptions", None)
+        if not children:
+            break
+        current = children[0]
+    text = str(current).strip() or type(current).__name__
+    if text.casefold().startswith(("error", "exception")):
+        _, _, rest = text.partition(":")
+        text = rest.strip() or text
+    return truncate_middle(text, 400)
+
+
+def make_mcp_connect_tool(registry: MCPRegistry) -> Tool[Any]:
+    async def mcp_connect(
+        ctx: RunContext[Any],
+        server_url: str,
+        headers_json: str = "",
+    ) -> str:
+        """Connect to a Model Context Protocol (MCP) server over HTTP(S).
+
+        server_url is the server's streamable-HTTP or SSE endpoint
+        (http:// or https://). headers_json is an optional JSON object of
+        HTTP headers (for example auth tokens). On success the session
+        restarts automatically and the server's tools become available
+        natively. Do not try to call them in this same turn \u2014 end the turn
+        instead. On failure this tool returns an error message instead of
+        raising.
+        """
+        url = (server_url or "").strip()
+        if not url:
+            return "error: mcp_connect requires a server_url argument."
+        if not url.startswith(("http://", "https://")):
+            return (
+                "error: mcp_connect only supports http:// or https:// "
+                f"endpoints, got {url!r}. For stdio servers use "
+                "--mcp-config at startup."
+            )
+        headers: dict[str, str] = {}
+        if headers_json:
+            try:
+                parsed = json.loads(headers_json)
+                if not isinstance(parsed, dict) or not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in parsed.items()
+                ):
+                    raise ValueError("headers must be strings")
+                headers = dict(parsed)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return (
+                    "error: headers_json must be a JSON object of string "
+                    f"headers, got: {headers_json!r}"
+                )
+        if url in registry.urls():
+            return (
+                f"{registry.describe(url)}\n"
+                "(already connected; no action needed.)"
+            )
+        try:
+            toolset = MCPToolset(
+                url,
+                headers=headers,
+                tool_error_behavior="error",
+                init_timeout=MCP_INIT_TIMEOUT,
+                read_timeout=MCP_READ_TIMEOUT,
+            )
+            async with asyncio.timeout(MCP_CONNECT_TIMEOUT):
+                async with toolset:
+                    tools = await toolset.list_tools()
+                    server_info = toolset.server_info
+            registry.add(
+                url,
+                toolset,
+                server_name=getattr(server_info, "name", "") or "",
+                server_version=getattr(server_info, "version", "") or "",
+                tool_names=[tool.name for tool in tools],
+            )
+        except Exception as exc:
+            return (
+                "error: could not connect to MCP server at "
+                f"{url}: {_mcp_error_text(exc)}"
+            )
+        try:
+            ctx.cancel()
+        except Exception as exc:
+            return (
+                "error: connected but could not restart the session: "
+                f"{_mcp_error_text(exc)}"
+            )
+        return registry.describe(url)
+
+    return Tool(
+        mcp_connect,
+        name="mcp_connect",
+        takes_ctx=True,
+        max_retries=1,
+        strict=False,
+    )
+
+
+def mcp_continuation_prompt(registry: MCPRegistry) -> str:
+    """The synthetic user prompt used to resume after an ``mcp_connect``."""
+    lines = ["Please continue."]
+    for url in registry.new_connections():
+        lines.append(
+            f"MCP server {registry.describe(url)} is now connected; its "
+            "tools are available natively."
+        )
+    return "\n".join(lines)
+
+
+def _closeout_dangling_tool_calls(messages: list[Any]) -> list[Any]:
+    """Append interrupted returns for tool calls left open by a cancelled run.
+
+    A run cancelled via ``RunContext.cancel`` (the mcp_connect tool) ends with
+    a model response whose tool calls have no results. Feeding that history
+    into a new run with a fresh prompt makes pydantic-ai raise UserError
+    ("unprocessed tool calls"), so close them out here the same way the
+    library closes an ``interrupted`` stream before a model receives it.
+    """
+    if not messages:
+        return messages
+    last = messages[-1]
+    parts = getattr(last, "parts", None)
+    if not isinstance(parts, list):
+        return messages
+    calls = [
+        part for part in parts if isinstance(part, ToolCallPart)
+    ]
+    if not calls:
+        return messages
+    returns = [
+        ToolReturnPart(
+            tool_name=call.tool_name,
+            content=(
+                "The tool call was interrupted before a result was produced."
+            ),
+            tool_call_id=call.tool_call_id,
+            outcome="interrupted",
+        )
+        for call in calls
+    ]
+    return [*messages, ModelRequest(parts=returns)]
+
+
 def build_system_prompt(
     settings: Settings,
     skill_index: str,
@@ -1168,6 +1376,15 @@ def build_system_prompt(
         if any("minecraft" in name.casefold() for name in mcp_server_names)
         else "\nMCP tools are exposed with server prefixes. Use them when the "
         "assigned workflow or project instructions require them.\n"
+    )
+    runtime_mcp_guidance = (
+        "\nRuntime MCP connections are supported: use the mcp_connect tool to "
+        "attach any MCP-over-HTTP(S) server during the session. On success the "
+        "session restarts automatically with that server's tools available "
+        "natively. Do not try to call a just-connected server's tools in the "
+        "same turn; end the turn and the environment resumes with the tools "
+        "registered. If mcp_connect returns an error, fix the URL or headers "
+        "and retry.\n"
     )
     if selected_skill is not None:
         try:
@@ -1206,6 +1423,7 @@ def build_system_prompt(
         inspection, edits, and verification. Project instructions define the
         exact writable paths. Do not escape the selected workspace.
         {minecraft_guidance}
+        {runtime_mcp_guidance}
 
         Skills are reusable workflows. If one clearly applies, read its full
         SKILL.md before using it.
@@ -1598,15 +1816,19 @@ class VerboseModel(WrapperModel):
 def build_agent(
     settings: Settings,
     discovery: DiscoveryResult,
+    mcp_registry: MCPRegistry | None = None,
 ) -> Agent[Any, str]:
     model = _make_model(settings)
     if settings.verbose:
         model = VerboseModel(model, label="agent")
-    toolsets = (
+    if mcp_registry is None:
+        mcp_registry = MCPRegistry()
+    toolsets: list[Any] = (
         load_mcp_toolsets(settings.mcp_config)
         if settings.mcp_config is not None
         else []
     )
+    toolsets.extend(mcp_registry.toolsets())
     return Agent(
         model=model,
         instructions=build_system_prompt(
@@ -1619,7 +1841,7 @@ def build_agent(
             discovery.mcp_server_names,
             discovery.selected_skill,
         ),
-        tools=[make_shell_tool(settings)],
+        tools=[make_shell_tool(settings), make_mcp_connect_tool(mcp_registry)],
         toolsets=toolsets,
         model_settings=OpenAIChatModelSettings(
             temperature=settings.temperature,
@@ -2131,6 +2353,7 @@ async def run_one_shot(
     settings: Settings,
     discovery: DiscoveryResult,
     options: OneShotOptions,
+    mcp_registry: MCPRegistry | None = None,
 ) -> str:
     prompt_path = options.prompt_file.resolve()
     artifact_path = options.artifact_dir.resolve()
@@ -2173,17 +2396,43 @@ async def run_one_shot(
     with capture_run_messages() as captured_messages:
         try:
             with Agent.parallel_tool_call_execution_mode("sequential"):
-                async with agent:
-                    result = await asyncio.wait_for(
-                        agent.run(
-                            prompt,
-                            message_history=None,
-                            usage_limits=UsageLimits(
-                                request_limit=options.request_limit,
-                            ),
-                        ),
-                        timeout=options.wall_clock_limit_seconds,
-                    )
+                rebuilds = 0
+                run_prompt = prompt
+                run_history: list[Any] | None = None
+                while True:
+                    async with agent:
+                        try:
+                            result = await asyncio.wait_for(
+                                agent.run(
+                                    run_prompt,
+                                    message_history=run_history,
+                                    usage_limits=UsageLimits(
+                                        request_limit=options.request_limit,
+                                    ),
+                                ),
+                                timeout=options.wall_clock_limit_seconds,
+                            )
+                            break
+                        except RunCancelled as exc:
+                            if (
+                                mcp_registry is None
+                                or not mcp_registry.new_connections()
+                                or rebuilds >= MAX_MCP_REBUILDS
+                            ):
+                                raise
+                            run_history = _closeout_dangling_tool_calls(
+                                list(exc.all_messages())
+                            )
+                            run_prompt = mcp_continuation_prompt(
+                                mcp_registry
+                            )
+                            rebuilds += 1
+                            agent = build_agent(
+                                settings,
+                                discovery,
+                                mcp_registry=mcp_registry,
+                            )
+                            mcp_registry.mark_built()
             messages = to_jsonable_python(result.all_messages())
             usage = asdict(result.usage)
             output = str(result.output)
@@ -2797,6 +3046,12 @@ async def _run_agent_turn(
                         else call
                     )
         except BaseException as exc:
+            if isinstance(exc, RunCancelled):
+                # First-party cancellation requested from a tool (mcp_connect):
+                # the host session rebuilds the agent with the newly connected
+                # MCP servers and resumes the conversation. Never classify this
+                # as an endpoint, parse, or boundary failure.
+                raise
             new_messages = captured[len(history) :]
             observed_usage = _captured_usage(to_jsonable_python(new_messages))
             _merge_usage(total_usage, observed_usage)
@@ -3022,19 +3277,51 @@ async def async_run_auto(
     )
     prompt = _prompt_text(prompt_or_path, cwd=settings.cwd)
     history = session.load_messages()
-    agent = build_agent(settings, discovery)
+    mcp_registry = MCPRegistry()
+    agent = build_agent(
+        settings,
+        discovery,
+        mcp_registry=mcp_registry,
+    )
     started = time.perf_counter()
     try:
-        async with agent:
-            result, captured, turn_usage = await _run_agent_turn(
-                agent,
-                prompt,
-                history,
-                settings=settings,
-                max_tokens=settings.max_tokens,
-                request_limit=request_limit,
-                wall_clock_limit=wall_clock_limit,
-            )
+        rebuilds = 0
+        while True:
+            async with agent:
+                try:
+                    result, captured, turn_usage = await _run_agent_turn(
+                        agent,
+                        prompt,
+                        history,
+                        settings=settings,
+                        max_tokens=settings.max_tokens,
+                        request_limit=request_limit,
+                        wall_clock_limit=wall_clock_limit,
+                    )
+                    break
+                except RunCancelled as exc:
+                    if (
+                        not mcp_registry.new_connections()
+                        or rebuilds >= MAX_MCP_REBUILDS
+                    ):
+                        raise
+                    history = _closeout_dangling_tool_calls(
+                        list(exc.all_messages())
+                    )
+                    prompt = mcp_continuation_prompt(mcp_registry)
+                    rebuilds += 1
+                    agent = build_agent(
+                        settings,
+                        discovery,
+                        mcp_registry=mcp_registry,
+                    )
+                    mcp_registry.mark_built()
+                    print(
+                        "\nMCP server connected; restarting agent with native "
+                        "tools.\n",
+                        file=sys.stderr,
+                        flush=True,
+                    )
         messages = result.all_messages()
         session.save_messages(messages)
         duration = round(time.perf_counter() - started, 6)
@@ -3194,11 +3481,14 @@ async def interactive_loop(
     settings: Settings,
     discovery: DiscoveryResult,
     session: SessionStore,
+    mcp_registry: MCPRegistry | None = None,
 ) -> None:
     message_history = session.load_messages()
     print_startup(settings, discovery)
     print(f"  run id:      {session.run_id}")
-    async with agent:
+    current_agent = agent
+    await current_agent.__aenter__()
+    try:
         while True:
             prompt = read_user_prompt()
             if prompt is None:
@@ -3215,13 +3505,36 @@ async def interactive_loop(
                 continue
             if not prompt.strip():
                 continue
-            result, _captured, turn_usage = await _run_agent_turn(
-                agent,
-                prompt,
-                message_history,
-                settings=settings,
-                max_tokens=settings.max_tokens,
-            )
+            try:
+                result, _captured, turn_usage = await _run_agent_turn(
+                    current_agent,
+                    prompt,
+                    message_history,
+                    settings=settings,
+                    max_tokens=settings.max_tokens,
+                )
+            except RunCancelled as exc:
+                if mcp_registry is None or not mcp_registry.new_connections():
+                    raise
+                rebuilt = build_agent(
+                    settings,
+                    discovery,
+                    mcp_registry=mcp_registry,
+                )
+                await rebuilt.__aenter__()
+                await current_agent.__aexit__(None, None, None)
+                current_agent = rebuilt
+                message_history = _closeout_dangling_tool_calls(
+                    list(exc.all_messages())
+                )
+                prompt = mcp_continuation_prompt(mcp_registry)
+                mcp_registry.mark_built()
+                print(
+                    "\nMCP server connected; restarting agent with native tools.\n",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
             message_history = result.all_messages()
             session.save_messages(message_history)
             session.append_run(
@@ -3233,6 +3546,8 @@ async def interactive_loop(
                 }
             )
             print(f"\nAgent> {result.output}\n")
+    finally:
+        await current_agent.__aexit__(None, None, None)
 
 
 async def async_main(argv: list[str] | None = None) -> None:
@@ -3242,8 +3557,19 @@ async def async_main(argv: list[str] | None = None) -> None:
     options = one_shot_options(args)
     if options is not None:
         os.chdir(settings.cwd)
-        agent = build_agent(settings, discovery)
-        output = await run_one_shot(agent, settings, discovery, options)
+        mcp_registry = MCPRegistry()
+        agent = build_agent(
+            settings,
+            discovery,
+            mcp_registry=mcp_registry,
+        )
+        output = await run_one_shot(
+            agent,
+            settings,
+            discovery,
+            options,
+            mcp_registry=mcp_registry,
+        )
         print(output)
         return
     if args.mode == "auto":
@@ -3285,11 +3611,19 @@ async def async_main(argv: list[str] | None = None) -> None:
         args.run_id,
         log_root=Path(args.log_root).expanduser(),
     )
+    mcp_registry = MCPRegistry()
     agent = build_agent(
         settings,
         discovery,
+        mcp_registry=mcp_registry,
     )
-    await interactive_loop(agent, settings, discovery, session)
+    await interactive_loop(
+        agent,
+        settings,
+        discovery,
+        session,
+        mcp_registry,
+    )
 
 
 def main() -> None:

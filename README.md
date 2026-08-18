@@ -137,6 +137,31 @@ workflow kernel can start a fresh attempt.
 
 Interactive commands include `/clear`, `/info`, `/paste`, and `/quit`.
 
+## Runtime MCP connections (mcp_connect)
+
+Beyond the MCP servers configured at startup (`--mcp-config`), pm-coder always
+ships a default `mcp_connect` tool. The agent can use it to attach any
+MCP-over-HTTP(S) server (streamable HTTP or SSE) during a session by supplying
+the server URL as plain text, plus an optional JSON object of HTTP headers
+(for example an auth token).
+
+```text
+mcp_connect(server_url="https://host/mcp", headers_json='{"Authorization": "Bearer xyz"}')
+```
+
+On success the tool cancels the current generation, pm-coder rebuilds the
+agent with that server's tools registered natively (exactly as if it had been
+in the MCP config), and resumes with the full message history. The model then
+calls the server's tools with real schemas, retries, and reconnects handled by
+pydantic-ai — the same as any configured server, and interactive sessions keep
+the connection warm between turns.
+
+On failure the tool returns a readable error message to the model instead of
+raising, so the agent can fix the URL or headers and retry. The tool never
+crashes the session. Auto and one-shot modes loop through at most
+`MAX_MCP_REBUILDS` rebuilds; stdio servers still require `--mcp-config` (a URL
+tool cannot launch a subprocess).
+
 ## Minecraft example (pm-minecraft)
 
 Point pm-coder at a pm-minecraft character workspace (e.g. `C:/Temp/Floppa`).
