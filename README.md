@@ -69,9 +69,9 @@ variable when the flag is not passed.
 | `--auto-compact` | off | &mdash; | Compress long sessions. When estimated context exceeds `context-window - compact-reserve-tokens`, the older turns are summarized and only the most recent ~`compact-keep-recent-tokens` are kept verbatim. |
 | `--context-window N` | `65536` | `LOCAL_AGENT_CONTEXT_WINDOW` | Estimated model context window in tokens. Used only by `--auto-compact`. |
 | `--compact-reserve-tokens N` | `16384` | `LOCAL_AGENT_COMPACT_RESERVE` | Tokens reserved for the next response when deciding to compact (matches pi's default). |
-| `--compact-keep-recent-tokens N` | `20000` | `LOCAL_AGENT_COMPACT_KEEP_RECENT` | Approximate tokens of the most recent conversation kept verbatim after compaction (matches pi's default). |
-| `--temperature T` | `0.1` | `LOCAL_AGENT_TEMPERATURE` | Sampling temperature. |
-| `--max-tokens N` | `8192` | `LOCAL_AGENT_MAX_TOKENS` | Generated tokens per model response. Use `-1` to remove the client response limit. |
+| `--compact-keep-recent-tokens N` | `16384` | `LOCAL_AGENT_COMPACT_KEEP_RECENT` | Approximate tokens of the most recent conversation kept verbatim after compaction (matches pi's default). |
+| `--temperature T` | `0.7` | `LOCAL_AGENT_TEMPERATURE` | Sampling temperature. |
+| `--max-tokens N` | `8_192` | `LOCAL_AGENT_MAX_TOKENS` | Generated tokens per model response (excluding thinking and tool calls). Use `-1` to remove the client response limit. |
 | `--enable-thinking` / `--disable-thinking` | enabled | &mdash; | Allow or disable provider-specific long-form reasoning. |
 | `--prompt-file PATH` | &mdash; | &mdash; | Prompt source file. With `--artifact-dir` enables legacy one-shot/heartbeat mode. |
 | `--artifact-dir DIR` | &mdash; | &mdash; | Legacy one-shot output directory (with `--prompt-file`, `--request-limit`, `--wall-clock-limit`). |

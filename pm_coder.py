@@ -278,7 +278,7 @@ def wrap_markdown(text: str, *, width: int = 80) -> str:
 
 APP_NAME = "private-machine-coder"
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
-DEFAULT_SHELL_TIMEOUT = 180
+DEFAULT_SHELL_TIMEOUT = 240
 # Compatibility for callers that imported the old public constant.
 DEFAULT_POWERSHELL_TIMEOUT = DEFAULT_SHELL_TIMEOUT
 # None leaves discovery and tool-output dimensions unbounded. The response
@@ -289,7 +289,8 @@ DEFAULT_MAX_SKILL_INDEX_CHARS: int | None = None
 DEFAULT_MAX_PROJECT_INSTRUCTIONS_CHARS: int | None = None
 DEFAULT_MAX_TOKENS: int | None = 8_192
 DEFAULT_LOG_ROOT = Path("~/.pm/pm-coder").expanduser()
-RECOVERY_TOOL_CALL_TOKEN_TARGET = 4_000
+RECOVERY_TOOL_CALL_TOKEN_TARGET = 4_096
+DEFAULT_TEMPERATURE = 0.7
 # How many times one turn may compact-and-continue after hitting the model
 # context window before giving up (each compaction buys back a full window's
 # worth of headroom, so a handful is generous).
@@ -299,7 +300,7 @@ MAX_COMPACT_RECOVERIES_PER_TURN = 6
 # model's, so it is separate and configurable.
 DEFAULT_CONTEXT_WINDOW: int = 65_536
 DEFAULT_COMPACT_RESERVE_TOKENS: int = 16_384
-DEFAULT_COMPACT_KEEP_RECENT_TOKENS: int = 20_000
+DEFAULT_COMPACT_KEEP_RECENT_TOKENS: int = 16_384
 MAX_TRANSIENT_RETRY_DELAY_SECONDS = 30.0
 MCP_CONFIG_CANDIDATES = (
     ".mcp.json",
@@ -769,7 +770,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=float(os.environ.get("LOCAL_AGENT_TEMPERATURE", "0.1")),
+        default=float(os.environ.get("LOCAL_AGENT_TEMPERATURE", DEFAULT_TEMPERATURE)),
     )
     parser.add_argument(
         "--max-tokens",
@@ -2958,7 +2959,7 @@ async def async_run_auto(
     max_tool_output: int | None = DEFAULT_MAX_TOOL_OUTPUT_CHARS,
     max_skill_index: int | None = DEFAULT_MAX_SKILL_INDEX_CHARS,
     max_project_instructions: int | None = DEFAULT_MAX_PROJECT_INSTRUCTIONS_CHARS,
-    temperature: float = 0.1,
+    temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
     enable_thinking: bool = True,
     skill: str | None = None,
@@ -3073,7 +3074,7 @@ def run_auto(
     max_tool_output: int | None = DEFAULT_MAX_TOOL_OUTPUT_CHARS,
     max_skill_index: int | None = DEFAULT_MAX_SKILL_INDEX_CHARS,
     max_project_instructions: int | None = DEFAULT_MAX_PROJECT_INSTRUCTIONS_CHARS,
-    temperature: float = 0.1,
+    temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
     enable_thinking: bool = True,
     skill: str | None = None,
@@ -3150,7 +3151,7 @@ def print_startup(settings: Settings, discovery: DiscoveryResult) -> None:
         + (", ".join(discovery.mcp_server_names) or "none configured")
     )
     print(f"  temperature:                {settings.temperature}")
-    print(f"  max tokens:                 {settings.max_tokens}")
+    print(f"  max tokens w/o think+tool:  {settings.max_tokens}")
     print(
         "  selected skill:             "
         + (discovery.selected_skill.name if discovery.selected_skill else "(none)")
