@@ -67,7 +67,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_core import to_jsonable_python
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import FoldedScalarString, LiteralScalarString
-from openai import AsyncOpenAI, DefaultAsyncHttpx2Client
+from openai import AsyncOpenAI
 from pydantic_ai.models import OpenAIChatCompatibleProvider
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIModelName
 from pydantic_ai.profiles import ModelProfileSpec
