@@ -23,7 +23,7 @@ import textwrap
 import traceback
 import urllib.request
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -482,6 +482,43 @@ class SessionStore:
             handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+class SessionPersistence:
+    """Write the session file from inside tool calls while a turn runs.
+
+    ``capture_run_messages`` hands the run loop a live list that the agent
+    graph uses as the in-progress message history, appending model responses
+    and tool-call results to it as the run advances. :meth:`arm` points at
+    that list, and every tool call flushes it to disk before and after it
+    executes, so a process killed mid-turn still shows the conversation up
+    to the tool call that was interrupted.
+    """
+
+    def __init__(self, session: SessionStore) -> None:
+        self.session = session
+        self._captured: list[Any] | None = None
+        self._warned = False
+
+    def arm(self, captured: list[Any]) -> None:
+        """Point at the live message list of the in-progress run."""
+        self._captured = captured
+
+    def flush(self) -> None:
+        """Write the session store with the conversation as it stands now."""
+        if self._captured is None:
+            return
+        try:
+            self.session.save_messages(self._captured)
+        except Exception as exc:
+            if self._warned:
+                return
+            self._warned = True
+            print(
+                f"pm-coder mid-turn save failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 def _prompt_text(prompt_or_path: str | Path, *, cwd: Path) -> str:
     value = Path(prompt_or_path).expanduser()
     if not value.is_absolute():
@@ -802,7 +839,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help=(
             "Maximum model requests for one turn, counting main-agent and "
-            "compaction-summary calls. 0 (the default) means unlimited."
+            "compaction-summary calls. 0 (the default) means 50."
         ),
     )
     parser.add_argument(
@@ -1086,7 +1123,10 @@ def truncate_middle(text: str, max_chars: int | None) -> str:
     return text[:head] + marker + text[-(remaining - head) :]
 
 
-def make_shell_tool(settings: Settings) -> Tool[Any]:
+def make_shell_tool(
+    settings: Settings,
+    on_tool_call: Callable[[], None] | None = None,
+) -> Tool[Any]:
     backend = shell_backend(settings)
 
     def host_shell(
@@ -1094,6 +1134,15 @@ def make_shell_tool(settings: Settings) -> Tool[Any]:
         timeout_seconds: int = settings.shell_timeout,
     ) -> str:
         """Execute a host-shell script in the selected agent workspace."""
+        if on_tool_call is not None:
+            on_tool_call()
+        try:
+            return _run_host_shell(command, timeout_seconds)
+        finally:
+            if on_tool_call is not None:
+                on_tool_call()
+
+    def _run_host_shell(command: str, timeout_seconds: int) -> str:
         print(f"\n[{backend.kind}]", flush=True)
         print(command.rstrip(), flush=True)
         timeout = None if timeout_seconds <= 0 else timeout_seconds
@@ -1595,9 +1644,39 @@ class VerboseModel(WrapperModel):
         return response
 
 
+def _wrap_toolset_calls(
+    toolset: Any,
+    on_tool_call: Callable[[], None],
+) -> Any:
+    """Bracket every MCP tool call with the session flush.
+
+    The combined toolset the agent builds delegates each call to the
+    originating child toolset's ``call_tool`` (:meth:`CombinedToolset.call_tool`
+    forwards to ``source_toolset.call_tool``), and those instances are reused
+    across runs, so replacing the bound method here catches every call.
+    """
+    original = toolset.call_tool
+
+    async def call_tool(
+        name: str,
+        tool_args: dict[str, Any],
+        ctx: Any,
+        tool: Any,
+    ) -> Any:
+        on_tool_call()
+        try:
+            return await original(name, tool_args, ctx, tool)
+        finally:
+            on_tool_call()
+
+    toolset.call_tool = call_tool  # type: ignore[method-assign]
+    return toolset
+
+
 def build_agent(
     settings: Settings,
     discovery: DiscoveryResult,
+    persistence: SessionPersistence | None = None,
 ) -> Agent[Any, str]:
     model = _make_model(settings)
     if settings.verbose:
@@ -1607,6 +1686,9 @@ def build_agent(
         if settings.mcp_config is not None
         else []
     )
+    on_tool_call = persistence.flush if persistence is not None else None
+    if on_tool_call is not None:
+        toolsets = [_wrap_toolset_calls(toolset, on_tool_call) for toolset in toolsets]
     return Agent(
         model=model,
         instructions=build_system_prompt(
@@ -1619,7 +1701,7 @@ def build_agent(
             discovery.mcp_server_names,
             discovery.selected_skill,
         ),
-        tools=[make_shell_tool(settings)],
+        tools=[make_shell_tool(settings, on_tool_call=on_tool_call)],
         toolsets=toolsets,
         model_settings=OpenAIChatModelSettings(
             temperature=settings.temperature,
@@ -2749,6 +2831,7 @@ async def _run_agent_turn(
     max_tokens: int | None = DEFAULT_MAX_TOKENS,
     request_limit: int | None = None,
     wall_clock_limit: int | None = None,
+    persistence: SessionPersistence | None = None,
 ) -> tuple[Any, list[Any], dict[str, Any]]:
     # 0 (or omitted) means unlimited for both budget knobs.
     request_limit = request_limit if request_limit else None
@@ -2784,6 +2867,8 @@ async def _run_agent_turn(
         captured: list[Any] = []
         try:
             with capture_run_messages() as captured:
+                if persistence is not None:
+                    persistence.arm(captured)
                 with Agent.parallel_tool_call_execution_mode("sequential"):
                     call = agent.run(
                         next_prompt,
@@ -3022,7 +3107,8 @@ async def async_run_auto(
     )
     prompt = _prompt_text(prompt_or_path, cwd=settings.cwd)
     history = session.load_messages()
-    agent = build_agent(settings, discovery)
+    persistence = SessionPersistence(session)
+    agent = build_agent(settings, discovery, persistence=persistence)
     started = time.perf_counter()
     try:
         async with agent:
@@ -3034,6 +3120,7 @@ async def async_run_auto(
                 max_tokens=settings.max_tokens,
                 request_limit=request_limit,
                 wall_clock_limit=wall_clock_limit,
+                persistence=persistence,
             )
         messages = result.all_messages()
         session.save_messages(messages)
@@ -3194,6 +3281,7 @@ async def interactive_loop(
     settings: Settings,
     discovery: DiscoveryResult,
     session: SessionStore,
+    persistence: SessionPersistence | None = None,
 ) -> None:
     message_history = session.load_messages()
     print_startup(settings, discovery)
@@ -3221,6 +3309,7 @@ async def interactive_loop(
                 message_history,
                 settings=settings,
                 max_tokens=settings.max_tokens,
+                persistence=persistence,
             )
             message_history = result.all_messages()
             session.save_messages(message_history)
@@ -3285,11 +3374,13 @@ async def async_main(argv: list[str] | None = None) -> None:
         args.run_id,
         log_root=Path(args.log_root).expanduser(),
     )
+    persistence = SessionPersistence(session)
     agent = build_agent(
         settings,
         discovery,
+        persistence=persistence,
     )
-    await interactive_loop(agent, settings, discovery, session)
+    await interactive_loop(agent, settings, discovery, session, persistence)
 
 
 def main() -> None:
