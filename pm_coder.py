@@ -31,7 +31,10 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Literal, cast
 from xml.sax.saxutils import escape, quoteattr
+import itertools
+import json
 
+import httpx2
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_ai import (
     Agent,
@@ -64,7 +67,110 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_core import to_jsonable_python
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import FoldedScalarString, LiteralScalarString
+from openai import AsyncOpenAI, DefaultAsyncHttpx2Client
+from pydantic_ai.models import OpenAIChatCompatibleProvider
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIModelName
+from pydantic_ai.profiles import ModelProfileSpec
+from pydantic_ai.providers import Provider
+from pydantic_ai.settings import ModelSettings
 
+class SingletonSessionContainer:
+    def __init__(self):
+        self.session: "SessionStore" = None
+
+singleton_session = SingletonSessionContainer()
+
+@dataclass(init=False)
+class LoggingOpenAIChatModel(OpenAIChatModel):
+    """
+    Drop-in OpenAIChatModel replacement that logs the final HTTP JSON body
+    sent to /chat/completions.
+
+    Logging happens below PydanticAI's message/tool conversion layer.
+    """
+
+    PRETTY_WIDTH = 120
+
+    def __init__(
+        self,
+        model_name: OpenAIModelName,
+        *,
+        provider: OpenAIChatCompatibleProvider
+        | Literal[
+            "openai",
+            "openai-chat",
+            "gateway",
+        ]
+        | Provider[AsyncOpenAI] = "openai",
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        # Let PydanticAI do exactly what it normally does.
+        super().__init__(
+            model_name,
+            provider=provider,
+            profile=profile,
+            settings=settings,
+        )
+
+        self._log_counter = itertools.count(1)
+
+        # AsyncOpenAI stores its underlying HTTPX/HTTPX2 client here.
+        #
+        # This is intentionally the only private API involved.
+        # We don't touch any PydanticAI request/message internals.
+        http_client = self.client._client
+
+        hooks = http_client.event_hooks
+        hooks.setdefault("request", [])
+        hooks["request"].append(self._log_http_request)
+
+    async def _log_http_request(self, request) -> None:
+        # Only capture actual Chat Completions calls.
+        if request.method != "POST":
+            return
+
+        if not request.url.path.rstrip("/").endswith("/chat/completions"):
+            return
+
+        try:
+            raw = bytes(request.content)
+
+            # Verify/parse it as JSON.
+            payload = json.loads(raw)
+
+            sequence = next(self._log_counter)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+            stem = Path(singleton_session.session.path) / f"{timestamp}_{sequence:06d}"
+
+            # ----------------------------------------------------------
+            # 1. RAW / COMPACT
+            #
+            # Write the ACTUAL bytes OpenAI is about to send.
+            # No json.loads -> json.dumps round trip.
+            # ----------------------------------------------------------
+
+            (stem.with_suffix(".compact.json")).write_bytes(raw)
+
+            # ----------------------------------------------------------
+            # 2. HUMAN-READABLE
+            # ----------------------------------------------------------
+
+            pretty = json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+            (stem.with_suffix(".pretty.json")).write_text(
+                pretty,
+                encoding="utf-8",
+            )
+
+        except Exception as exc:
+            # Logging should never be capable of breaking inference.
+            print(f"[prompt logger] failed to dump request: {exc!r}")
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(
@@ -72,7 +178,6 @@ class StrictModel(BaseModel):
         populate_by_name=True,
         validate_assignment=True,
     )
-
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """Replace one file atomically after flushing its temporary peer."""
@@ -405,6 +510,7 @@ class SessionStore:
         self.human_messages_path = path / "messages.yaml"
         self.runs_path = path / "runs.jsonl"
         self.path.mkdir(parents=True, exist_ok=True)
+        singleton_session.session = self
 
     @property
     def run_id(self) -> str:
@@ -1636,13 +1742,13 @@ def build_agent(
     )
 
 
-def _make_model(settings: Settings) -> OpenAIChatModel:
+def _make_model(settings: Settings) -> LoggingOpenAIChatModel:
     """Shared OpenAI-compatible model used by the agent and summarization."""
     profile = OpenAIModelProfile(
         openai_supports_strict_tool_definition=False,
         openai_chat_supports_multiple_system_messages=False,
     )
-    return OpenAIChatModel(
+    return LoggingOpenAIChatModel(
         settings.model,
         provider=OpenAIProvider(
             base_url=settings.base_url,
@@ -3293,6 +3399,7 @@ async def async_main(argv: list[str] | None = None) -> None:
 
 
 def main() -> None:
+    print("Heyo :3")
     try:
         asyncio.run(async_main())
     except KeyboardInterrupt:
