@@ -179,6 +179,13 @@ class StrictModel(BaseModel):
         validate_assignment=True,
     )
 
+def get_usage_limits(limit: int | None):
+    """
+    UsageLimits MUST be passed with EXPLICIT NONE, otherwise defaults to 50!
+    pm-coder failed: UsageLimitExceeded: The next request would exceed the request_limit of 50
+    """
+    return UsageLimits(request_limit=None if limit == 0 else limit)
+
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """Replace one file atomically after flushing its temporary peer."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -381,7 +388,7 @@ def wrap_markdown(text: str, *, width: int = 80) -> str:
         wrapped.extend(" " * len(prefix) + part for part in parts[1:])
     return "\n".join(wrapped).rstrip() + "\n"
 
-APP_NAME = "private-machine-coder"
+APP_NAME = "pm-coder"
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_SHELL_TIMEOUT = 240
 # Compatibility for callers that imported the old public constant.
@@ -2284,9 +2291,7 @@ async def run_one_shot(
                         agent.run(
                             prompt,
                             message_history=None,
-                            usage_limits=UsageLimits(
-                                request_limit=options.request_limit,
-                            ),
+                            usage_limits=get_usage_limits(options.request_limit)
                         ),
                         timeout=options.wall_clock_limit_seconds,
                     )
@@ -2875,18 +2880,7 @@ async def _run_agent_turn(
     )
 
     while True:
-        remaining_requests = (
-            request_limit - used_requests if request_limit is not None else None
-        )
-        if remaining_requests is not None and remaining_requests <= 0:
-            raise UsageLimitExceeded(
-                f"The agent turn used its {request_limit} model requests"
-            )
-        limits = (
-            UsageLimits(request_limit=remaining_requests)
-            if remaining_requests is not None
-            else None
-        )
+        limits = get_usage_limits(request_limit)
         captured: list[Any] = []
         try:
             with capture_run_messages() as captured:
