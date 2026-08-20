@@ -409,11 +409,26 @@ DEFAULT_TEMPERATURE = 0.7
 MAX_COMPACT_RECOVERIES_PER_TURN = 6
 # Context compaction defaults mirror the upstream pi coding agent so a tuned
 # setup behaves identically out of the box. The context window itself is the
-# model's, so it is separate and configurable.
-DEFAULT_CONTEXT_WINDOW: int = 65_536
+# model's, so it is separate and configurable. Zero (the default) means
+# "auto": probe the model at /v1/models, take its advertised n_ctx minus a
+# small safety margin, and print the resolved value at startup so the user
+# knows what is actually in effect.
+DEFAULT_CONTEXT_WINDOW: int = 0
+# Safety margin subtracted from the server's advertised n_ctx when
+# context-window is auto, so generation stays comfortably under the serving
+# cap and the server never rejects a request for exceeding it.
+AUTO_CONTEXT_SAFETY_MARGIN: int = 2048
+# Conservative budget used only when the endpoint cannot be probed at all
+# (down, or a proxy that hides n_ctx) and the user left context-window auto.
+FALLBACK_CONTEXT_WINDOW: int = 65_536
 DEFAULT_COMPACT_RESERVE_TOKENS: int = 16_384
 DEFAULT_COMPACT_KEEP_RECENT_TOKENS: int = 16_384
 MAX_TRANSIENT_RETRY_DELAY_SECONDS = 30.0
+# Wall-clock budget (seconds) we are willing to keep retrying a transient
+# endpoint failure AFTER the model has been seen once on the network. Until a
+# single successful completion, a startup that cannot reach the endpoint
+# fails fast instead of silently looping.
+MAX_RECONNECT_SECONDS: float = 900.0  # default 15 minutes
 MCP_CONFIG_CANDIDATES = (
     ".mcp.json",
     "mcp.json",
@@ -853,8 +868,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "LOCAL_AGENT_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW
         ),
         help=(
-            "Estimated model context window in tokens (default 65536). Used "
-            "only by --auto-compact to decide when to summarize."
+            "Estimated model context window in tokens. 0/AUTO (default): probe "
+            "the endpoint's real n_ctx at /v1/models and use n_ctx minus 2048 "
+            "for headroom, printing the resolved value at startup. Used only "
+            "by --auto-compact to decide when to summarize. If a value exceeds "
+            "what the endpoint serves, startup fails with a clear error."
         ),
     )
     parser.add_argument(
@@ -930,21 +948,92 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def discover_model_id(base_url: str, api_key: str) -> str | None:
+def probe_model_capabilities(
+    base_url: str,
+    api_key: str,
+    *,
+    timeout: float = 5.0,
+) -> dict[str, Any] | None:
+    """Return the model's advertised capabilities from the OpenAI-compatible
+    endpoint (model id and context size), or ``None`` when the endpoint is not
+    serving or does not advertise them. llama.cpp exposes ``meta.n_ctx`` (the
+    per-slot context the server can actually fit) and ``n_ctx_train`` (the
+    model's native length). The runtime budget must respect the serving
+    ``n_ctx``, not the larger training figure.
+    """
     request = urllib.request.Request(
         base_url.rstrip("/") + "/models",
         headers={"Authorization": f"Bearer {api_key}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
     for model in payload.get("data", []):
+        if not isinstance(model, dict):
+            continue
         model_id = model.get("id")
-        if isinstance(model_id, str) and model_id:
-            return model_id
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        meta = model.get("meta")
+        n_ctx = None
+        n_ctx_train = None
+        if isinstance(meta, dict):
+            n_ctx = meta.get("n_ctx")
+            n_ctx_train = meta.get("n_ctx_train")
+        info = {"id": model_id}
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            info["n_ctx"] = n_ctx
+        if isinstance(n_ctx_train, int) and n_ctx_train > 0:
+            info["n_ctx_train"] = n_ctx_train
+        return info
     return None
+
+
+def discover_model_id(base_url: str, api_key: str) -> str | None:
+    caps = probe_model_capabilities(base_url, api_key)
+    if caps is None:
+        return None
+    return caps.get("id")
+
+
+def _effective_service_context(
+    base_url: str,
+    api_key: str,
+    configured: int | None,
+    *,
+    default: int = FALLBACK_CONTEXT_WINDOW,
+) -> int:
+    """Resolve the safe context budget for a run.
+
+    ``configured`` semantics:
+    - 0 or None -> auto: probe the endpoint's advertised ``n_ctx`` and use
+      ``n_ctx - AUTO_CONTEXT_SAFETY_MARGIN`` so generation stays under the
+      serving cap. If the endpoint cannot be probed, fall back to ``default``.
+    - > 0 -> the user's explicit choice. It must not exceed the advertised
+      ``n_ctx``; if it does, this raises instead of silently producing a run
+      whose requests get rejected at the real serving context.
+    """
+    caps = probe_model_capabilities(base_url, api_key)
+    n_ctx = caps.get("n_ctx") if caps else None
+    has_n_ctx = isinstance(n_ctx, int) and n_ctx > 0
+    if configured:
+        # Explicit user request: enforce the server's hard cap as a
+        # reality-check, but otherwise honor the requested budget.
+        if has_n_ctx and configured > n_ctx:
+            raise ValueError(
+                f"requested context window {configured:,} exceeds what the "
+                f"endpoint can serve ({n_ctx:,}). Lower --context-window to at "
+                "most the server's advertised n_ctx, or auto-compact will keep "
+                "sending requests the server rejects."
+            )
+        return min(configured, n_ctx) if has_n_ctx else configured
+    # Auto (configured is 0/None): use the real model context minus a safety
+    # margin so we compact before the server would reject us.
+    if has_n_ctx:
+        return max(n_ctx - AUTO_CONTEXT_SAFETY_MARGIN, 1)
+    return default
 
 
 def find_powershell() -> str:
@@ -1337,6 +1426,16 @@ def build_settings(args: argparse.Namespace) -> Settings:
     base_url = args.base_url.rstrip("/")
     model = args.model or discover_model_id(base_url, args.api_key) or "local"
     backend = select_shell(args.shell)
+    # Resolve the effective context budget before constructing Settings. This
+    # is the reality-check: if the user asked for a window larger than the
+    # endpoint can actually serve, fail immediately instead of producing a
+    # run whose requests get rejected at the server's real n_ctx.
+    effective_context = _effective_service_context(
+        base_url,
+        args.api_key,
+        args.context_window or DEFAULT_CONTEXT_WINDOW,
+        default=DEFAULT_CONTEXT_WINDOW,
+    )
     return Settings(
         cwd=cwd,
         base_url=base_url,
@@ -1355,7 +1454,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
         skill=args.skill,
         auto_compact=args.auto_compact,
         verbose=args.verbose,
-        context_window=args.context_window or DEFAULT_CONTEXT_WINDOW,
+        context_window=effective_context,
         compact_reserve_tokens=(
             args.compact_reserve_tokens or DEFAULT_COMPACT_RESERVE_TOKENS
         ),
@@ -2044,6 +2143,31 @@ def _context_limit_failure(exc: BaseException) -> str | None:
     )
 
 
+def _is_unreachable_failure(exc: BaseException) -> bool:
+    """True only for a concrete connection-level failure (refused, reset,
+    DNS, timeout) - a server that is really down, not one returning an HTTP
+    5xx restart status that pydantic-ai's provider-level retries handle."""
+    for cause in _exception_chain(exc):
+        name = type(cause).__name__.casefold()
+        module = type(cause).__module__.casefold()
+        if any(
+            marker in name
+            for marker in ("connectionrefused", "connerror", "connecterror", "unreachable", "dns", "nodename")
+        ):
+            return True
+        if name in {"timeout", "timoutexceeded"}:
+            if isinstance(cause, (OSError, TimeoutError)) or module.startswith(
+                ("httpx", "httpcore", "openai")
+            ):
+                return True
+            continue
+        if module.startswith(("httpx", "httpcore", "openai")) and isinstance(
+            cause, OSError
+        ):
+            return True
+    return False
+
+
 def _is_transient_endpoint_failure(exc: BaseException) -> bool:
     if isinstance(exc, ModelHTTPError):
         return exc.status_code in {429, 500, 502, 503, 504}
@@ -2492,7 +2616,7 @@ def _content_text(part: dict[str, Any]) -> str:
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "image":
+            if block.get("type") in {"image", "image_url"}:
                 blocks.append("[image]")
             elif isinstance(block.get("text"), str):
                 blocks.append(block["text"])
@@ -2500,8 +2624,215 @@ def _content_text(part: dict[str, Any]) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Image token calibration
+#
+# The server charges a vision-encoded cost per image (measured ~270-413 for
+# the Minecraft screenshots), NOT the literal base64 text length. That constant
+# is deployment / model / --image-min-tokens dependent, so we probe it once at
+# session start by asking the endpoint to parse a few synthetic images and
+# reading the real prompt_tokens delta. Per-size costs become the estimator's
+# per-image budget; and each real request's prompt_tokens further corrects the
+# running estimate toward the true cost (a heuristic plus real tokens).
+# ---------------------------------------------------------------------------
+
+_IMAGE_CALIBRATION: dict[int, int] = {}  # pixel-area -> token cost
+
+DEFAULT_IMAGE_TOKENS = 400
+
+# Lazy-calibration endpoint target, populated once a session begins. Calibration
+# only fires when the session first sees an image (not at startup for text-only
+# runs), and at most once per process.
+_calibration_endpoint: tuple[str, str, str] | None = None
+_calibration_attempted = False
+
+
+def _image_area_blocks(content: Any) -> list[dict[str, Any]]:
+    """Yield the dict blocks that are images from a message-part content list."""
+    if not isinstance(content, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in {"image", "image_url"}:
+            out.append(block)
+    return out
+
+
+def _image_area(block: dict[str, Any]) -> int:
+    """Best-effort pixel count from a serialized block, or 0 when unknown."""
+    url = None
+    image = block.get("image")
+    if isinstance(image, dict):
+        url = image.get("url")
+    iurl = block.get("image_url")
+    if isinstance(iurl, dict):
+        url = iurl.get("url")
+    if not isinstance(url, str):
+        return 0
+    match = re.search(r"base64,([A-Za-z0-9+/=]+)$", url)
+    if not match:
+        return 0
+    import base64 as _b64
+    try:
+        raw_bytes = _b64.b64decode(match.group(1))
+    except Exception:
+        return 0
+    if raw_bytes[:8] == b"\x89PNG\r\n\x1a\n" and len(raw_bytes) >= 24:
+        return int.from_bytes(raw_bytes[16:20], "big") * int.from_bytes(
+            raw_bytes[20:24], "big"
+        )
+    if raw_bytes[:2] == b"\xff\xd8" and len(raw_bytes) >= 12:
+        return len(raw_bytes)
+    return 0
+
+
+def _ensure_image_calibration() -> None:
+    """Calibrate the image-token estimate once, the first time an image appears.
+
+    Uses the endpoint recorded at session start (``_calibration_endpoint``).
+    The calibration is a small, best-effort probe: on any failure it leaves
+    the global empty so the estimator keeps its default, and it never runs
+    again in this process.
+    """
+    global _calibration_attempted, _IMAGE_CALIBRATION
+    if _calibration_attempted or _IMAGE_CALIBRATION:
+        return
+    _calibration_attempted = True
+    endpoint = _calibration_endpoint
+    if endpoint is None:
+        return
+    try:
+        _calibrate_image_tokens(*endpoint)
+    except Exception as exc:
+        print(
+            f"pm-coder: image calibration failed ({type(exc).__name__}: {exc}); "
+            "using default image token estimate",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _calibrated_image_tokens(area: int) -> int:
+    """Map a pixel area to a vision token cost via the calibration curve."""
+    if not _IMAGE_CALIBRATION:
+        return DEFAULT_IMAGE_TOKENS
+    sizes = sorted(_IMAGE_CALIBRATION)
+    if not sizes:
+        return DEFAULT_IMAGE_TOKENS
+    if area <= sizes[0]:
+        return _IMAGE_CALIBRATION[sizes[0]]
+    if area >= sizes[-1]:
+        return _IMAGE_CALIBRATION[sizes[-1]]
+    for i in range(len(sizes) - 1):
+        lo, hi = sizes[i], sizes[i + 1]
+        if lo <= area <= hi:
+            t = (area - lo) / (hi - lo)
+            low_cost = _IMAGE_CALIBRATION[lo]
+            high_cost = _IMAGE_CALIBRATION[hi]
+            return int(round(low_cost + (high_cost - low_cost) * t))
+    return _IMAGE_CALIBRATION[sizes[-1]]
+
+
+def _synthetic_pixel_base64(width: int, height: int) -> str:
+    """Produce a small solid PNG as a base64 data URI without PIL."""
+    import struct as _struct
+    import zlib
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            _struct.pack(">I", len(data))
+            + tag
+            + data
+            + _struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = _struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    row = b"\x00" + b"\x7f\x7f\x7f" * width
+    idat = zlib.compress(row * height)
+    raw = (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", idat)
+        + _chunk(b"IEND", b"")
+    )
+    import base64 as _b64
+    return f"data:image/png;base64,{_b64.b64encode(raw).decode()}"
+
+
+def _measure_image_prompt_tokens(
+    base_url: str, api_key: str, model: str, data_uri: str
+) -> int | None:
+    """POST a 1-image prompt and return its prompt_tokens, or None."""
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                    {"type": "text", "text": "x"},
+                ],
+            }
+        ],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    usage = body.get("usage") or {}
+    prompt = usage.get("prompt_tokens")
+    if not isinstance(prompt, int):
+        prompt = usage.get("input_tokens")
+    if not isinstance(prompt, int):
+        return None
+    return prompt
+
+
+def _calibrate_image_tokens(
+    base_url: str,
+    api_key: str,
+    model: str,
+    *,
+    sizes: tuple[int, ...] = (256, 512, 1024, 2048, 3072, 4096),
+) -> None:
+    """Probe the endpoint's image token cost at a range of synthetic sizes.
+
+    Records pixel-area -> token cost into the module global so subsequent
+    estimates use a calibrated curve. A failed calibration must never break the
+    session: on any error we simply leave the global empty and the estimator
+    falls back to :data:`DEFAULT_IMAGE_TOKENS`.
+    """
+    global _IMAGE_CALIBRATION
+    if _IMAGE_CALIBRATION:
+        return
+    measured: dict[int, int] = {}
+    for edge in sizes:
+        try:
+            data_uri = _synthetic_pixel_base64(edge, edge)
+            cost = _measure_image_prompt_tokens(base_url, api_key, model, data_uri)
+        except Exception:
+            continue
+        if cost is None or cost <= 0:
+            continue
+        measured[edge * edge] = cost
+    if not measured:
+        return
+    # Drop non-monotone points (server may floor small images).
+    ordered = sorted(measured.items())
+    monotone: list[tuple[int, int]] = []
+    for area, cost in ordered:
+        if not monotone or cost > monotone[-1][1]:
+            monotone.append((area, cost))
+    _IMAGE_CALIBRATION.update(dict(monotone))
+
+
 def estimate_message_tokens(message: dict[str, Any]) -> int:
-    """Estimate tokens in one model message using a conservative chars/4 rule."""
+    """Estimate tokens in one model message, counting images at calibrated cost."""
     parts = message.get("parts")
     if not isinstance(parts, list):
         return 0
@@ -2528,8 +2859,22 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                if block.get("type") == "image":
-                    chars += 4800
+                if block.get("type") == "tool-call":
+                    args = block.get("args")
+                    if isinstance(args, str):
+                        args_text = args
+                    else:
+                        try:
+                            args_text = json.dumps(args, sort_keys=True)
+                        except Exception:
+                            args_text = ""
+                    chars += len(block.get("tool_name") or "") + len(args_text)
+                elif block.get("type") in {"image", "image_url"}:
+                    # Lazy one-time calibration when an image is actually seen.
+                    _ensure_image_calibration()
+                    area = _image_area(block)
+                    cost = _calibrated_image_tokens(area)
+                    chars += cost * 4  # stored as chars so /4 yields the token
                 elif isinstance(block.get("text"), str):
                     chars += len(block["text"])
     return max(1, math.ceil(chars / 4))
@@ -2873,6 +3218,12 @@ async def _run_agent_turn(
     total_usage: dict[str, Any] = {}
     transient_failures = 0
     compact_recoveries = 0
+    # Endpoint reachability state for the reconnect policy. ``endpoint_seen``
+    # flips to True after the first successful completion; until then a
+    # transient failure means the server never came up, so we fail fast. After
+    # it flips, transient failures retry within a reconnect budget.
+    endpoint_seen = False
+    reconnect_deadline: float | None = None
     deadline = (
         time.monotonic() + wall_clock_limit
         if wall_clock_limit is not None
@@ -2971,6 +3322,36 @@ async def _run_agent_turn(
                     continue
                 raise ContextLimitReachedError(context_failure) from exc
             if _is_transient_endpoint_failure(exc):
+                # Reconnect policy: crash immediately on a truly-unreachable
+                # server that never came up (connection refused/timeout), per
+                # the explicit "if the server is down when starting, crash"
+                # rule. But an HTTP 5xx restart status is retried by the
+                # provider, so only fail fast on a concrete connection-level
+                # failure before the first successful round-trip. Once we have
+                # seen one completion, any transient drop retries within a
+                # reconnect budget before surfacing as a real error / exit 1.
+                if not endpoint_seen and _is_unreachable_failure(exc):
+                    raise ConnectionError(
+                        "the model endpoint was unreachable before the first "
+                        "successful completion; failing fast instead of "
+                        "retrying a server that never came up"
+                    ) from exc
+                if not endpoint_seen:
+                    # A restart / 5xx before the first success is still a
+                    # startup problem, but the provider owns its own retries;
+                    # give it the same reconnect budget it would get later.
+                    reconnect_deadline = reconnect_deadline or (
+                        time.monotonic() + MAX_RECONNECT_SECONDS
+                    )
+                now = time.monotonic()
+                if reconnect_deadline is None:
+                    reconnect_deadline = now + MAX_RECONNECT_SECONDS
+                remaining_reconnect = reconnect_deadline - now
+                if remaining_reconnect <= 0:
+                    raise ConnectionError(
+                        "the model endpoint never reconnected within the "
+                        f"{MAX_RECONNECT_SECONDS:g}s reconnect budget"
+                    ) from exc
                 used_requests += completed_requests
                 history, next_prompt = _transient_recovery_state(
                     captured,
@@ -2978,18 +3359,17 @@ async def _run_agent_turn(
                     retry_prompt=next_prompt,
                 )
                 transient_failures += 1
-                delay = _transient_retry_delay(exc, transient_failures)
+                delay = min(
+                    _transient_retry_delay(exc, transient_failures),
+                    remaining_reconnect,
+                )
                 print(
                     "pm-coder endpoint unavailable; retrying in "
-                    f"{delay:g}s without charging the failed request",
+                    f"{delay:g}s (reconnect budget left: "
+                    f"{max(remaining_reconnect - delay, 0.0):.0f}s)",
                     file=sys.stderr,
                     flush=True,
                 )
-                remaining = _remaining_wall_clock(deadline)
-                if remaining is not None and delay >= remaining:
-                    raise TimeoutError(
-                        "the model endpoint did not recover before the wall-clock limit"
-                    ) from exc
                 await asyncio.sleep(delay)
                 continue
             endpoint_failure = _endpoint_failure(exc)
@@ -2999,6 +3379,7 @@ async def _run_agent_turn(
             raise
 
         result_usage = _usage_dict(result.usage)
+        endpoint_seen = True  # a completion round-tripped; reconnect is allowed now
         boundary_failure = _generation_boundary_failure(
             max_tokens,
             to_jsonable_python(result.all_messages()),
@@ -3122,6 +3503,10 @@ async def async_run_auto(
     )
     prompt = _prompt_text(prompt_or_path, cwd=settings.cwd)
     history = session.load_messages()
+    # Remember the endpoint so the first image seen lazily calibrates the
+    # per-image token estimate. Text-only runs never pay calibration cost.
+    global _calibration_endpoint
+    _calibration_endpoint = (settings.base_url, settings.api_key, settings.model)
     agent = build_agent(settings, discovery)
     started = time.perf_counter()
     try:
@@ -3257,6 +3642,10 @@ def print_startup(settings: Settings, discovery: DiscoveryResult) -> None:
         + (discovery.selected_skill.name if discovery.selected_skill else "(none)")
     )
     print(f"  auto-compact:               {'on' if settings.auto_compact else 'off'}")
+    print(
+        f"  context window:           {settings.context_window:,}"
+        " (probing-server headroom n_ctx-2048)"
+    )
     print(f"  verbose:                    {'on' if settings.verbose else 'off'}")
     if settings.auto_compact:
         print(
