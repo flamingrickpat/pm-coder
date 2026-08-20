@@ -403,10 +403,6 @@ DEFAULT_MAX_TOKENS: int | None = 8_192
 DEFAULT_LOG_ROOT = Path("~/.pm/pm-coder").expanduser()
 RECOVERY_TOOL_CALL_TOKEN_TARGET = 4_096
 DEFAULT_TEMPERATURE = 0.7
-# How many times one turn may compact-and-continue after hitting the model
-# context window before giving up (each compaction buys back a full window's
-# worth of headroom, so a handful is generous).
-MAX_COMPACT_RECOVERIES_PER_TURN = 6
 # Context compaction defaults mirror the upstream pi coding agent so a tuned
 # setup behaves identically out of the box. The context window itself is the
 # model's, so it is separate and configurable. Zero (the default) means
@@ -1015,6 +1011,8 @@ def _effective_service_context(
       ``n_ctx``; if it does, this raises instead of silently producing a run
       whose requests get rejected at the real serving context.
     """
+    return 98000
+
     caps = probe_model_capabilities(base_url, api_key)
     n_ctx = caps.get("n_ctx") if caps else None
     has_n_ctx = isinstance(n_ctx, int) and n_ctx > 0
@@ -2220,6 +2218,8 @@ def _endpoint_failure(exc: BaseException) -> tuple[type[RuntimeError], str] | No
 
 def _safe_recovery_history(messages: list[Any], *, prefix_count: int) -> list[Any]:
     """Keep completed history and remove only the failed terminal exchange."""
+    return messages
+
     data = to_jsonable_python(messages)
     cutoff = len(messages)
     for index in range(prefix_count, len(messages)):
@@ -2565,6 +2565,19 @@ def _usage_dict(usage: Any) -> dict[str, Any]:
         if isinstance(input_tokens, int) and isinstance(output_tokens, int):
             value["total_tokens"] = input_tokens + output_tokens
     return value
+
+import json
+from dataclasses import replace
+from typing import Any
+
+from pydantic_core import to_jsonable_python
+from pydantic_ai import Agent
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    UserPromptPart,
+    TextPart,
+)
 
 
 # Context compaction. This mirrors the upstream pi coding agent's logic:
@@ -2985,140 +2998,339 @@ def _serialize_conversation(data: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-async def _maybe_compact_history(
-    agent: Agent[Any, str],
+RAW_TURN_FRACTION = 0.20
+EDGE_TOKENS = 2048
+
+# We split summary input by characters deliberately.
+# Exact tokenizer accounting is unnecessary here.
+SUMMARY_OVERLAP_CHARS = 6000
+
+
+SUMMARIZATION_PROMPT = """
+You are compacting the execution history of an autonomous coding agent.
+
+Produce a dense checkpoint containing only information useful for continuing
+the task correctly.
+
+Preserve:
+- the user's requirements, constraints, corrections, and acceptance criteria
+- important facts discovered about the project
+- architectural or implementation decisions that still matter
+- files/symbols that were changed and what was changed
+- tests/checks already run and their results
+- important errors and their causes
+- failed approaches worth not repeating
+- unfinished work, open questions, and the next useful actions
+
+Do NOT preserve:
+- chain of thought, reasoning narration, or speculation that led nowhere
+- conversational filler
+- chronological narration merely for completeness
+- full file contents, diffs, directory listings, command output, or other
+  information that can cheaply be obtained again from the filesystem, git,
+  or tools
+
+The filesystem, repository, git working tree, and tools are persistent external
+memory. Prefer saying what should be re-read/re-checked over reproducing it.
+
+Distinguish facts from unresolved hypotheses when that matters.
+Do not invent anything.
+
+Write the checkpoint as compact Markdown.
+"""
+
+
+def _tokens(messages: list[Any]) -> int:
+    return estimate_context_tokens(to_jsonable_python(messages))
+
+
+def _is_user_turn(message: Any) -> bool:
+    return isinstance(message, ModelRequest) and any(
+        isinstance(part, UserPromptPart) for part in message.parts
+    )
+
+
+def _turn_ranges(history: list[Any]) -> list[tuple[int, int]]:
+    starts = [i for i, message in enumerate(history) if _is_user_turn(message)]
+    return [
+        (start, starts[n + 1] if n + 1 < len(starts) else len(history))
+        for n, start in enumerate(starts)
+    ]
+
+
+def _serialize(messages: list[Any]) -> str:
+    """Lossy serialization specifically for the summarizer."""
+    lines = []
+
+    for message in to_jsonable_python(messages):
+        kind = message["kind"]
+
+        for part in message["parts"]:
+            part_kind = part["part_kind"]
+
+            if part_kind == "reasoning":
+                continue
+
+            if kind == "request" and part_kind == "user-prompt":
+                lines.append(f"USER:\n{_content_text(part)}")
+
+            elif kind == "request" and part_kind == "tool-return":
+                lines.append(f"TOOL RESULT:\n{_content_text(part)}")
+
+            elif kind == "response" and part_kind == "tool-call":
+                args = part.get("args")
+                if not isinstance(args, str):
+                    args = json.dumps(args, default=str)
+                lines.append(
+                    f"TOOL CALL: {part.get('tool_name', '')}({args})"
+                )
+
+            elif kind == "response" and part_kind in {"text", "final-output"}:
+                lines.append(f"ASSISTANT:\n{_content_text(part)}")
+
+    return "\n\n".join(lines)
+
+
+def _is_context_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "context size",
+            "context length",
+            "context window",
+            "context full",
+            "too many tokens",
+            "prompt is too long",
+            "exceeds the available context",
+            "maximum context",
+        )
+    )
+
+
+async def _summarize_text(
+    settings: Settings,
+    text: str,
+) -> tuple[str, int]:
+    """
+    Try summarizing directly.
+
+    If the summarizer itself runs out of context, split roughly in half with
+    overlap, recursively summarize both halves, and concatenate.
+    """
+    try:
+        summary_agent = _make_summary_agent(settings)
+
+        async with summary_agent:
+            result = await summary_agent.run(
+                f"<conversation>\n{text}\n</conversation>\n\n"
+                + SUMMARIZATION_PROMPT
+            )
+
+        return str(result.output).strip(), int(result.usage.requests)
+
+    except Exception as exc:
+        if not _is_context_error(exc):
+            raise
+
+        mid = len(text) // 2
+        overlap = min(SUMMARY_OVERLAP_CHARS, mid // 2)
+
+        left = text[: mid + overlap]
+        right = text[mid - overlap :]
+
+        # If even this cannot shrink any further, something other than the
+        # supplied conversation is consuming the context. Let it crash.
+        if len(left) >= len(text) or len(right) >= len(text):
+            raise
+
+        left_summary, left_requests = await _summarize_text(
+            settings, left
+        )
+        right_summary, right_requests = await _summarize_text(
+            settings, right
+        )
+
+        summary = (
+            "[EARLIER PORTION]\n"
+            f"{left_summary}\n\n"
+            "[LATER PORTION]\n"
+            f"{right_summary}"
+        )
+
+        return summary, left_requests + right_requests
+
+
+async def _summarize(
+    settings: Settings,
+    messages: list[Any],
+) -> tuple[str, int]:
+    return await _summarize_text(settings, _serialize(messages))
+
+
+def _strip_images(history: list[Any]) -> list[Any]:
+    """
+    Assistant images are expendable once context recovery begins.
+
+    ModelResponse in your PydanticAI version exposes `images`, as shown in
+    your debugger.
+    """
+    return [
+        replace(message, images=[])
+        if isinstance(message, ModelResponse) and message.images
+        else message
+        for message in history
+    ]
+
+
+def _checkpoint(text: str) -> TextPart:
+    return TextPart(
+        content=(
+            "\n\n[AUTOCOMPACTED EXECUTION CHECKPOINT]\n"
+            "This is a lossy assistant-generated memory of omitted execution "
+            "history, not a new user instruction.\n\n"
+            f"{text}\n"
+            "[END AUTOCOMPACTED CHECKPOINT]\n\n"
+        )
+    )
+
+
+async def _compact_turn(
+    settings: Settings,
+    turn: list[Any],
+    edge_tokens: int,
+) -> tuple[list[Any], int] | None:
+    """
+    Turn:
+        UserRequest
+        Response
+        ToolReturnRequest
+        Response
+        ToolReturnRequest
+        Response
+        ...
+
+    We only cut immediately BEFORE a ModelResponse. Therefore the raw head
+    ends in a request and the raw tail starts in a response. The summary is
+    prepended to that response, keeping tool-call/tool-return structure sane.
+    """
+    cuts = [
+        i for i, message in enumerate(turn)
+        if isinstance(message, ModelResponse)
+    ]
+
+    head_cuts = [
+        i for i in cuts
+        if _tokens(turn[:i]) >= edge_tokens
+    ]
+
+    tail_cuts = [
+        i for i in cuts
+        if _tokens(turn[i:]) >= edge_tokens
+    ]
+
+    if not head_cuts or not tail_cuts:
+        return None
+
+    head_cut = head_cuts[0]
+    tail_cut = tail_cuts[-1]
+
+    if tail_cut <= head_cut:
+        return None
+
+    # Deliberately summarize the WHOLE turn, not merely the omitted middle.
+    # The preserved raw head/tail give exact detail; this gives coherent state.
+    summary, requests = await _summarize(settings, turn)
+
+    head = list(turn[:head_cut])
+    tail = list(turn[tail_cut:])
+
+    tail[0] = replace(
+        tail[0],
+        parts=[_checkpoint(summary), *tail[0].parts],
+    )
+
+    return head + tail, requests
+
+
+async def _compact_middle_turns(
+    settings: Settings,
+    history: list[Any],
+    edge_tokens: int,
+) -> tuple[list[Any], int] | None:
+    """
+    Keep complete early turns and complete recent turns verbatim.
+    Summarize complete turns in the middle.
+    """
+    ranges = _turn_ranges(history)
+
+    if len(ranges) < 3:
+        return None
+
+    # Keep enough complete turns at the beginning.
+    left = 0
+    kept = 0
+    while left < len(ranges) - 1 and kept < edge_tokens:
+        start, end = ranges[left]
+        kept += _tokens(history[start:end])
+        left += 1
+
+    # Keep enough complete turns at the end.
+    right = len(ranges)
+    kept = 0
+    while right > left + 1 and kept < edge_tokens:
+        right -= 1
+        start, end = ranges[right]
+        kept += _tokens(history[start:end])
+
+    if right <= left:
+        return None
+
+    middle_start = ranges[left][0]
+    middle_end = ranges[right][0]
+
+    middle = history[middle_start:middle_end]
+    summary, requests = await _summarize(settings, middle)
+
+    head = list(history[:middle_start])
+    tail = list(history[middle_end:])
+
+    # The middle begins at a fresh user turn, so the preceding complete turn
+    # ends in a ModelResponse. Attach the assistant-generated memory there.
+    head[-1] = replace(
+        head[-1],
+        parts=[*head[-1].parts, _checkpoint(summary)],
+    )
+
+    return head + tail, requests
+
+
+async def _collapse_largest_turn(
     settings: Settings,
     history: list[Any],
 ) -> tuple[list[Any], int]:
-    """Summarize older turns when the context grows large.
-
-    Returns ``(new_history, summary_requests)`` where ``summary_requests`` is
-    the number of model requests the summary pass used (0 when no compaction
-    happened). A failed summarization never breaks the session: it logs a
-    warning and returns the original history unchanged with a zero count.
     """
-    if not settings.auto_compact or not history:
-        return history, 0
-    data = to_jsonable_python(history)
-    if not isinstance(data, list):
-        return history, 0
-    context_tokens = estimate_context_tokens(data)
-    threshold = settings.context_window - settings.compact_reserve_tokens
-    if context_tokens <= threshold:
-        return history, 0
-    cut_index = _find_cut_index(data, settings.compact_keep_recent_tokens)
-    if cut_index is None or cut_index <= 0:
-        return history, 0
-    prefix = history[:cut_index]
-    kept = history[cut_index:]
-    if not kept:
-        return history, 0
-    if settings.verbose:
-        print(
-            f"pm-coder verbose compact: context {context_tokens:,} tokens "
-            f"exceeds threshold {threshold:,}; summarizing the first "
-            f"{len(prefix)} message(s) and keeping {len(kept)} message(s) verbatim",
-            file=sys.stdout,
-            flush=True,
-        )
-    conversation_text = _serialize_conversation(data[:cut_index])
-    summary_requests = 0
-    try:
-        summary_agent = _make_summary_agent(settings)
-        async with summary_agent:
-            result = await summary_agent.run(
-                f"<conversation>\n{conversation_text}\n</conversation>\n\n"
-                + SUMMARIZATION_PROMPT
-            )
-        summary_requests = int(result.usage.requests)
-        summary_text = str(result.output).strip()
-        if not summary_text:
-            raise RuntimeError("summarization returned an empty summary")
-    except BaseException as exc:
-        print(
-            f"pm-coder compact skipped: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return history, 0
-    if settings.verbose:
-        print(
-            "pm-coder verbose compact: summary:\n"
-            f"{summary_text}\n",
-            file=sys.stdout,
-            flush=True,
-        )
-    new_history = [_merge_summary_into_first_request(kept[0], summary_text)] + kept[1:]
-    print(
-        f"pm-coder compact: summarized {len(prefix)} older message(s) into the "
-        f"next user turn (context {context_tokens:,} -> ~{estimate_context_tokens(to_jsonable_python(new_history)):,} tokens)",
-        file=sys.stderr,
-        flush=True,
-    )
-    return new_history, summary_requests
+    Last-resort hammer.
 
-
-async def _force_compact(
-    agent: Agent[Any, str], settings: Settings, messages: list[Any]
-) -> tuple[list[Any] | None, int]:
-    """Summarize the entire given messages into a single user-role checkpoint.
-
-    Used on a mid-turn context-limit where clean turn boundaries do not exist
-    (a single ``agent.run`` turn is one user prompt plus a chain of tool
-    exchanges, so cut-point compaction finds nothing to cut). Returning the
-    whole accumulation as one summary reclaims maximum headroom so the task
-    can continue from the checkpoint. Returns ``(checkpoint, requests)``.
+    Preserve the original user request verbatim and replace the rest of the
+    largest turn with its summary. Used when there is no useful middle left.
     """
-    if not messages:
-        return None, 0
-    data = to_jsonable_python(messages)
-    if not isinstance(data, list) or not data:
-        return None, 0
-    if settings.verbose:
-        print(
-            f"pm-coder verbose recovery: force-compacting {len(messages)} "
-            "message(s) into a single checkpoint",
-            file=sys.stdout,
-            flush=True,
-        )
-    conversation_text = _serialize_conversation(data)
-    requests = 0
-    try:
-        summary_agent = _make_summary_agent(settings)
-        async with summary_agent:
-            result = await summary_agent.run(
-                f"<conversation>\n{conversation_text}\n</conversation>\n\n"
-                + SUMMARIZATION_PROMPT
-            )
-        requests = int(result.usage.requests)
-        summary_text = str(result.output).strip()
-        if not summary_text:
-            return None, requests
-    except BaseException as exc:
-        print(
-            f"pm-coder recovery: force-compact skipped: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return None, 0
-    if settings.verbose:
-        print(
-            "pm-coder verbose compact: summary:\n"
-            f"{summary_text}\n",
-            file=sys.stdout,
-            flush=True,
-        )
-    checkpoint = ModelRequest(
-        parts=[
-            UserPromptPart(
-                content=(
-                    "[Checkpoint summary of the conversation so far]\n"
-                    f"{summary_text}"
-                )
-            )
-        ]
+    ranges = _turn_ranges(history)
+
+    start, end = max(
+        ranges,
+        key=lambda r: _tokens(history[r[0]:r[1]]),
     )
-    return [checkpoint], requests
+
+    turn = history[start:end]
+    summary, requests = await _summarize(settings, turn)
+
+    collapsed = [
+        turn[0],
+        ModelResponse(parts=[_checkpoint(summary)]),
+    ]
+
+    return history[:start] + collapsed + history[end:], requests
 
 
 async def _compact_for_recovery(
@@ -3129,72 +3341,79 @@ async def _compact_for_recovery(
     compact_recoveries: int,
     detail: str,
 ) -> tuple[list[Any], str, int, int] | None:
-    """Compress history after a context-limit so the turn can continue.
-
-    First tries the normal cut-point compaction (keeps recent turns verbatim).
-    When that cannot reclaim anything because the long turn has no clean user
-    boundaries, it falls back to force-compacting the whole accumulation into
-    one checkpoint. Returns ``(new_history, next_prompt, compact_recoveries,
-    extra_requests)`` on success, or ``None`` when nothing can be reclaimed or
-    the per-turn cap of compaction recoveries has been reached; the caller
-    then raises. ``extra_requests`` is the number of model requests the
-    summary pass consumed, so it counts toward the request budget.
     """
-    if compact_recoveries >= MAX_COMPACT_RECOVERIES_PER_TURN or not safe_history:
-        return None
-    compacted, requests = await _maybe_compact_history(agent, settings, safe_history)
-    if len(compacted) < len(safe_history):
+    Called ONLY after the model actually reports that context is full.
+
+    Every subsequent recovery keeps less raw edge context.
+    """
+    history = _strip_images(safe_history)
+
+    # 2048 -> 1024 -> 512 -> 256 -> ...
+    edge_tokens = max(
+        256,
+        EDGE_TOKENS // (2 ** compact_recoveries),
+    )
+
+    requests = 0
+    changed = False
+
+    # First: kill monster turns. A single completed 30k-token coding turn
+    # should not permanently consume 30k tokens of every future request.
+    for start, end in reversed(_turn_ranges(history)):
+        turn = history[start:end]
+
+        if _tokens(turn) <= settings.context_window * RAW_TURN_FRACTION:
+            continue
+
+        compacted = await _compact_turn(
+            settings,
+            turn,
+            edge_tokens,
+        )
+
+        if compacted is None:
+            continue
+
+        new_turn, used = compacted
+        history[start:end] = new_turn
+        requests += used
+        changed = True
+
+    if changed:
         return (
-            compacted,
+            history,
             _context_full_recovery_prompt(),
             compact_recoveries + 1,
             requests,
         )
-    forced, force_requests = await _force_compact(agent, settings, safe_history)
-    if forced is None or len(forced) >= len(safe_history):
-        return None
-    return (
-        forced,
-        _context_full_recovery_prompt(),
-        compact_recoveries + 1,
-        force_requests,
+
+    # No individual monster turn: preserve conversation edges and summarize
+    # complete user/assistant turns in the middle.
+    compacted = await _compact_middle_turns(
+        settings,
+        history,
+        edge_tokens,
     )
 
+    if compacted is not None:
+        history, used = compacted
 
-def _merge_summary_into_first_request(
-    first: Any, summary_text: str
-) -> Any:
-    """Prepend the summary into the first kept user request, keeping the message
-    stream alternating cleanly between user and assistant turns."""
-    parts = list(getattr(first, "parts", None) or [])
-    new_parts: list[Any] = []
-    inserted = False
-    for part in parts:
-        if isinstance(part, UserPromptPart) and not inserted:
-            new_parts.append(
-                UserPromptPart(
-                    content=(
-                        "[Checkpoint summary of the earlier conversation]\n"
-                        f"{summary_text}\n\n\n"
-                        f"{part.content}"
-                    )
-                )
-            )
-            inserted = True
-        else:
-            new_parts.append(part)
-    if not inserted:
-        new_parts.insert(
-            0,
-            UserPromptPart(
-                content=(
-                    "[Checkpoint summary of the earlier conversation]\n"
-                    f"{summary_text}"
-                )
-            ),
+        return (
+            history,
+            _context_full_recovery_prompt(),
+            compact_recoveries + 1,
+            used,
         )
-    return ModelRequest(parts=new_parts)
 
+    # Nothing clever left to do. Collapse the fattest turn.
+    history, used = await _collapse_largest_turn(settings, history)
+
+    return (
+        history,
+        _context_full_recovery_prompt(),
+        compact_recoveries + 1,
+        used,
+    )
 
 async def _run_agent_turn(
     agent: Agent[Any, str],
@@ -3206,24 +3425,14 @@ async def _run_agent_turn(
     request_limit: int | None = None,
     wall_clock_limit: int | None = None,
 ) -> tuple[Any, list[Any], dict[str, Any]]:
-    # 0 (or omitted) means unlimited for both budget knobs.
-    request_limit = request_limit if request_limit else None
-    wall_clock_limit = wall_clock_limit if wall_clock_limit else None
-    history = list(message_history or [])
-    history, compact_requests = await _maybe_compact_history(
-        agent, settings, history
-    )
-    next_prompt = prompt
-    used_requests = compact_requests
-    total_usage: dict[str, Any] = {}
-    transient_failures = 0
-    compact_recoveries = 0
-    # Endpoint reachability state for the reconnect policy. ``endpoint_seen``
-    # flips to True after the first successful completion; until then a
-    # transient failure means the server never came up, so we fail fast. After
-    # it flips, transient failures retry within a reconnect budget.
+
     endpoint_seen = False
-    reconnect_deadline: float | None = None
+    compact_recoveries = 0
+    history = list(message_history or [])
+    next_prompt = prompt
+    detail = ""
+    reconnect_tries = 0
+
     deadline = (
         time.monotonic() + wall_clock_limit
         if wall_clock_limit is not None
@@ -3235,11 +3444,11 @@ async def _run_agent_turn(
         captured: list[Any] = []
         try:
             with capture_run_messages() as captured:
-                with Agent.parallel_tool_call_execution_mode("sequential"):
+                with Agent.parallel_tool_call_execution_mode("parallel"):
                     call = agent.run(
                         next_prompt,
                         message_history=history or None,
-                        **({"usage_limits": limits} if limits is not None else {}),
+                        **({"usage_limits": limits}),
                     )
                     timeout = _remaining_wall_clock(deadline)
                     result = await (
@@ -3248,166 +3457,27 @@ async def _run_agent_turn(
                         else call
                     )
         except BaseException as exc:
-            new_messages = captured[len(history) :]
-            observed_usage = _captured_usage(to_jsonable_python(new_messages))
-            _merge_usage(total_usage, observed_usage)
-            completed_requests = int(observed_usage.get("requests", 0) or 0)
-            safe_history = _safe_recovery_history(
-                captured,
-                prefix_count=len(history),
-            )
-
+            # tool error -> prompt again
             parse_failure = _tool_call_parse_failure(exc)
-            boundary_failure = _generation_boundary_failure(
-                max_tokens,
-                to_jsonable_python(captured),
-            )
             if parse_failure is not None:
-                used_requests += completed_requests + 1
-                total_usage["requests"] = int(total_usage.get("requests", 0) or 0) + 1
-                history = safe_history
-                next_prompt = _tool_call_parse_feedback(parse_failure)
-                transient_failures = 0
-                print(f"pm-coder recovery: {parse_failure}", file=sys.stderr, flush=True)
-                continue
-            if boundary_failure is not None:
-                error_class, detail = boundary_failure
-                if error_class is ContextLimitReachedError:
-                    recovery = await _compact_for_recovery(
-                        agent,
-                        settings,
-                        safe_history,
-                        next_prompt,
-                        compact_recoveries,
-                        detail,
-                    )
-                    if recovery is not None:
-                        history, next_prompt, compact_recoveries, extra = recovery
-                        used_requests += completed_requests + extra
-                        transient_failures = 0
-                        print(
-                            "pm-coder recovery: compacted context after limit "
-                            f"({detail})",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        continue
-                    raise error_class(detail) from exc
-                used_requests += completed_requests
-                history = safe_history
-                next_prompt = _response_limit_feedback(max_tokens)
-                transient_failures = 0
-                print(f"pm-coder recovery: {detail}", file=sys.stderr, flush=True)
-                continue
-            context_failure = _context_limit_failure(exc)
-            if context_failure is not None:
-                recovery = await _compact_for_recovery(
-                    agent,
-                    settings,
-                    safe_history,
-                    next_prompt,
-                    compact_recoveries,
-                    context_failure,
-                )
-                if recovery is not None:
-                    history, next_prompt, compact_recoveries, extra = recovery
-                    used_requests += completed_requests + extra
-                    transient_failures = 0
-                    print(
-                        "pm-coder recovery: compacted context after limit "
-                        f"({context_failure})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    continue
-                raise ContextLimitReachedError(context_failure) from exc
-            if _is_transient_endpoint_failure(exc):
-                # Reconnect policy: crash immediately on a truly-unreachable
-                # server that never came up (connection refused/timeout), per
-                # the explicit "if the server is down when starting, crash"
-                # rule. But an HTTP 5xx restart status is retried by the
-                # provider, so only fail fast on a concrete connection-level
-                # failure before the first successful round-trip. Once we have
-                # seen one completion, any transient drop retries within a
-                # reconnect budget before surfacing as a real error / exit 1.
-                if not endpoint_seen and _is_unreachable_failure(exc):
-                    raise ConnectionError(
-                        "the model endpoint was unreachable before the first "
-                        "successful completion; failing fast instead of "
-                        "retrying a server that never came up"
-                    ) from exc
-                if not endpoint_seen:
-                    # A restart / 5xx before the first success is still a
-                    # startup problem, but the provider owns its own retries;
-                    # give it the same reconnect budget it would get later.
-                    reconnect_deadline = reconnect_deadline or (
-                        time.monotonic() + MAX_RECONNECT_SECONDS
-                    )
-                now = time.monotonic()
-                if reconnect_deadline is None:
-                    reconnect_deadline = now + MAX_RECONNECT_SECONDS
-                remaining_reconnect = reconnect_deadline - now
-                if remaining_reconnect <= 0:
-                    raise ConnectionError(
-                        "the model endpoint never reconnected within the "
-                        f"{MAX_RECONNECT_SECONDS:g}s reconnect budget"
-                    ) from exc
-                used_requests += completed_requests
-                history, next_prompt = _transient_recovery_state(
+                history = _safe_recovery_history(
                     captured,
                     prefix_count=len(history),
-                    retry_prompt=next_prompt,
                 )
-                transient_failures += 1
-                delay = min(
-                    _transient_retry_delay(exc, transient_failures),
-                    remaining_reconnect,
-                )
-                print(
-                    "pm-coder endpoint unavailable; retrying in "
-                    f"{delay:g}s (reconnect budget left: "
-                    f"{max(remaining_reconnect - delay, 0.0):.0f}s)",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                await asyncio.sleep(delay)
+                next_prompt = _tool_call_parse_feedback(parse_failure)
+                print(f"pm-coder recovery: {parse_failure}", file=sys.stderr, flush=True)
                 continue
-            endpoint_failure = _endpoint_failure(exc)
-            if endpoint_failure is not None:
-                error_class, detail = endpoint_failure
-                raise error_class(detail) from exc
-            raise
 
-        result_usage = _usage_dict(result.usage)
-        endpoint_seen = True  # a completion round-tripped; reconnect is allowed now
-        boundary_failure = _generation_boundary_failure(
-            max_tokens,
-            to_jsonable_python(result.all_messages()),
-        )
-        if boundary_failure is None:
-            _merge_usage(total_usage, result_usage)
-            return result, captured, total_usage
-
-        error_class, detail = boundary_failure
-        _merge_usage(total_usage, result_usage)
-        used_requests += int(result_usage.get("requests", 0) or 0)
-        if error_class is ContextLimitReachedError:
-            safe_result = _safe_recovery_history(
-                result.all_messages(),
-                prefix_count=len(history),
-            )
-            recovery = await _compact_for_recovery(
-                agent,
-                settings,
-                safe_result,
-                next_prompt,
-                compact_recoveries,
-                detail,
-            )
-            if recovery is not None:
-                history, next_prompt, compact_recoveries, extra = recovery
-                used_requests += extra
-                transient_failures = 0
+            context_failure = _context_limit_failure(exc)
+            if context_failure is not None:
+                history, next_prompt, compact_recoveries, extra = await _compact_for_recovery(
+                    agent,
+                    settings,
+                    history,
+                    next_prompt,
+                    compact_recoveries,
+                    detail,
+                )
                 print(
                     "pm-coder recovery: compacted context after limit "
                     f"({detail})",
@@ -3415,14 +3485,24 @@ async def _run_agent_turn(
                     flush=True,
                 )
                 continue
-            raise error_class(detail)
-        history = _safe_recovery_history(
-            result.all_messages(),
-            prefix_count=len(history),
-        )
-        next_prompt = _response_limit_feedback(max_tokens)
-        transient_failures = 0
-        print(f"pm-coder recovery: {detail}", file=sys.stderr, flush=True)
+
+            if _is_transient_endpoint_failure(exc):
+                delay = 30
+                print(
+                    "pm-coder endpoint unavailable; retrying in "
+                    f"{delay:g}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            endpoint_failure = _endpoint_failure(exc)
+            if endpoint_failure is not None:
+                error_class, detail = endpoint_failure
+                raise error_class(detail) from exc
+            raise
+        return result, captured, 0
 
 
 async def async_run_auto(
@@ -3788,12 +3868,12 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         raise SystemExit(130) from None
-    except Exception as exc:
-        print(
-            f"{APP_NAME} failed: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        raise SystemExit(1) from exc
+    #except Exception as exc:
+    #    print(
+    #        f"{APP_NAME} failed: {type(exc).__name__}: {exc}",
+    #        file=sys.stderr,
+    #    )
+    #    raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":
