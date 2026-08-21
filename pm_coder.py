@@ -49,6 +49,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent, Tool, UsageLimits, capture_run_messages
 from pydantic_ai.mcp import load_mcp_toolsets
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
@@ -736,6 +737,9 @@ def make_shell_tool(settings: Settings) -> Tool[Any]:
 # fails loudly and can be retried, while a wrong line range succeeds and
 # deletes the wrong code, which is not a failure an unattended run survives.
 # Line numbers appear only in `read` output, to be quoted back verbatim.
+# read_image is the visual variant: Pydantic AI turns a BinaryContent tool
+# return into a base64 image_url user message, so the tool just hands the
+# bytes back and the framework does the rest.
 # ---------------------------------------------------------------------------
 
 
@@ -794,6 +798,13 @@ def match_hint(text: str, needle: str) -> str:
     return f"\nClosest lines in the file:\n{rendered}"
 
 
+IMAGE_MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+}
+
+
 def make_file_tools(settings: Settings) -> list[Tool[Any]]:
     def read(path: str, offset: int = 1, limit: int = 0) -> str:
         """Read a text file. Line numbers are prepended; they are for reference
@@ -812,6 +823,30 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
             header += f", showing lines {start}-{end}"
         body = "\n".join(f"{number}: {lines[number - 1]}" for number in range(start, end + 1))
         return f"{header}\n{body}"
+
+    def read_image(path: str):
+        """Attach a JPG or PNG image to the conversation so the model can see
+        it. The image is returned alongside a short text confirmation; the
+        model receives both as visual input. Use this for screenshots,
+        diagrams, or any picture the task refers to.
+        """
+        target = resolve_path(settings, path)
+        print(f"\n[read_image {target}]", file=sys.stderr, flush=True)
+        if not target.is_file():
+            return [f"error: file does not exist: {target}"]
+        media_type = IMAGE_MEDIA_TYPES.get(target.suffix.lower())
+        if media_type is None:
+            return [
+                f"error: unsupported image type {target.suffix or '(none)'} in "
+                f"{target}; use .jpg, .jpeg, or .png"
+            ]
+        data = target.read_bytes()
+        if not data:
+            return [f"error: file is empty: {target}"]
+        return [
+            BinaryContent(data, media_type=media_type),
+            f"image attached: {target} ({len(data):,} bytes)",
+        ]
 
     def write(path: str, content: str) -> str:
         """Create a new file, or completely rewrite an existing one, as UTF-8.
@@ -871,6 +906,7 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
 
     return [
         Tool(read, takes_ctx=False, name="read", sequential=True, strict=False),
+        Tool(read_image, takes_ctx=False, name="read_image", sequential=True, strict=False),
         Tool(write, takes_ctx=False, name="write", sequential=True, strict=False),
         Tool(edit, takes_ctx=False, name="edit", sequential=True, strict=False),
     ]
@@ -1137,7 +1173,8 @@ def build_system_prompt(settings: Settings, discovery: DiscoveryResult) -> str:
         unique string: copy `old_string` verbatim out of a `read`, including
         its indentation. Use `write` for a new file or a deliberate full
         rewrite. Prefer one larger `edit` of a coherent block over several
-        small interleaved ones.
+        small interleaved ones. Use `read_image` to look at a JPG or PNG
+        image; the picture itself becomes part of the conversation.
 
         `{shell.kind}` starts in the selected workspace. Use it for everything
         else: running commands, searching, and verifying results. Project

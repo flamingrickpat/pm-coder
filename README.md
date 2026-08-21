@@ -3,7 +3,8 @@
 ## minimal coding agent with mcp and skills for local llms like qwen 3.6
 
 Unattended coding agent for local OpenAI-compatible models, with MCP
-discovery, project instructions, skills, and read/write/edit/shell tools.
+discovery, project instructions, skills, and read/read_image/write/edit/shell
+tools.
 Built to be started once and left running: no request limits, no wall-clock
 limits, and a single recovery loop that compacts its own context and
 reconnects forever.
@@ -58,11 +59,12 @@ process.
 
 ## Tools
 
-Four built-in tools, plus whatever the MCP servers contribute:
+Five built-in tools, plus whatever the MCP servers contribute:
 
 | Tool | Signature | Notes |
 | --- | --- | --- |
 | `read` | `read(path, offset=1, limit=0)` | Line numbers are prepended for reference. `limit=0` reads the whole file. |
+| `read_image` | `read_image(path)` | Attaches a JPG or PNG to the conversation as a base64 image, so a vision-capable model can see it. |
 | `write` | `write(path, content)` | Creates a file or fully rewrites one. Always UTF-8, no BOM. |
 | `edit` | `edit(path, old_string, new_string, replace_all=False)` | Exact string match, must be unique unless `replace_all`. |
 | `powershell` / `bash` | `(command, timeout_seconds)` | Everything else: running, searching, verifying. Named after the selected backend. |
@@ -85,6 +87,12 @@ editing a CRLF file on Windows does not rewrite every line.
 escape the same content twice -- once for the tool-call JSON, once for the
 shell -- and PowerShell 5.1's `Set-Content` silently writes the system ANSI
 codepage rather than UTF-8.
+
+`read_image` is the visual counterpart of `read`: the file's bytes come back
+as `BinaryContent`, which Pydantic AI renders as a base64 `image_url` user
+message -- the same wire path MCP screenshots already take. Images are
+dropped first when compaction needs room, and require a vision-capable model
+(e.g. qwen-vl) to actually be understood.
 
 ## Options
 
