@@ -2,8 +2,12 @@
 
 ## minimal coding agent with mcp and skills for local llms like qwen 3.6
 
-Bounded coding agent for local OpenAI-compatible models, with MCP discovery,
-project instructions, skills, and a host-shell tool.
+Unattended coding agent for local OpenAI-compatible models, with MCP
+discovery, project instructions, skills, and read/read_image/write/edit/shell
+tools.
+Built to be started once and left running: no request limits, no wall-clock
+limits, and a single recovery loop that compacts its own context and
+reconnects forever.
 
 ## Install
 
@@ -28,19 +32,67 @@ When you start pm-coder it prints its effective configuration so you can
 verify it is set up the way you expect:
 
 ```text
-private-machine-coder
-  cwd:                        C:\Users\you\project
-  endpoint:                   http://127.0.0.1:8080/v1
-  model:                      qwen
-  shell:                      powershell (C:\...\powershell.exe)
-  skills:                     9
-  instructions:               0 file(s)
-  MCP servers:                none configured
-  temperature:                0.1
-  max tokens:                 8192
-  selected skill:             (none)
-  auto-compact:               off
+pm-coder
+  cwd:            C:\Users\you\project
+  endpoint:       http://127.0.0.1:8080/v1
+  model:          qwen
+  shell:          powershell (C:\...\powershell.exe)
+  mcp servers:    none configured
+  skills:         9
+  selected skill: (none)
+  instructions:   0 file(s)
+  temperature:    0.7
+  max tokens:     8192
+  context window: 96,256
+  verbose:        off
+  run id:         2026-08-21_10-54-29_C_Users_you_project
+  session dir:    C:\Users\you\.pm\pm-coder\2026-08-21_10-54-29_C_Users_you_project
 ```
+
+Everything pm-coder says about itself goes to **stderr**. Only the turn's
+result goes to stdout, so `--mode auto` output stays parseable even while the
+shell tool is echoing commands. Both streams are forced to UTF-8, because
+Windows otherwise picks the console codepage and a single em-dash in a model
+response is enough to make the JSON invalid for whatever is parsing it. If you
+call the Python API instead and redirect stderr, do the same in your own
+process.
+
+## Tools
+
+Five built-in tools, plus whatever the MCP servers contribute:
+
+| Tool | Signature | Notes |
+| --- | --- | --- |
+| `read` | `read(path, offset=1, limit=0)` | Line numbers are prepended for reference. `limit=0` reads the whole file. |
+| `read_image` | `read_image(path)` | Attaches a JPG or PNG to the conversation as a base64 image, so a vision-capable model can see it. |
+| `write` | `write(path, content)` | Creates a file or fully rewrites one. Always UTF-8, no BOM. |
+| `edit` | `edit(path, old_string, new_string, replace_all=False)` | Exact string match, must be unique unless `replace_all`. |
+| `powershell` / `bash` | `(command, timeout_seconds)` | Everything else: running, searching, verifying. Named after the selected backend. |
+
+Files are addressed by **exact content, never by line number**. Every serious
+agent harness converged on this independently -- aider dropped line numbers
+from its diff hunks, Anthropic's editor tool uses `old_str`/`new_str`, and
+OpenAI's `apply_patch` anchors on surrounding context -- because a wrong
+string fails loudly and can be retried, while a wrong line range *succeeds*
+and deletes the wrong code. That distinction decides whether an unattended
+overnight run degrades or corrupts. Line numbers appear only in `read` output,
+to be quoted back verbatim.
+
+`edit` reports the closest matching lines when `old_string` does not match, so
+a model that missed by one level of indentation can fix it in one step instead
+of re-reading the file. A file's existing line endings are preserved, so
+editing a CRLF file on Windows does not rewrite every line.
+
+`write`/`edit` exist because doing this through the shell forces the model to
+escape the same content twice -- once for the tool-call JSON, once for the
+shell -- and PowerShell 5.1's `Set-Content` silently writes the system ANSI
+codepage rather than UTF-8.
+
+`read_image` is the visual counterpart of `read`: the file's bytes come back
+as `BinaryContent`, which Pydantic AI renders as a base64 `image_url` user
+message -- the same wire path MCP screenshots already take. Images are
+dropped first when compaction needs room, and require a vision-capable model
+(e.g. qwen-vl) to actually be understood.
 
 ## Options
 
@@ -50,155 +102,165 @@ variable when the flag is not passed.
 
 | Option | Default | Environment | What it does |
 | --- | --- | --- | --- |
-| `--mode {interactive,auto}` | `interactive` | &mdash; | Run a persistent chat session (interactive) or one JSON-producing prompt (auto). |
+| `--mode {interactive,auto}` | `interactive` | &mdash; | Run a persistent chat session (interactive), or one prompt that runs to completion and exits (auto). |
 | `--auto` | &mdash; | &mdash; | Shortcut for `--mode auto`. |
 | `--prompt` (positional) | &mdash; | &mdash; | Prompt text (auto mode) or a path to a UTF-8 text file. |
-| `--run-id RUN_ID` | none | &mdash; | Resume the session directory `~/.pm/pm-coder/<RUN_ID>`. |
-| `--log-root DIR` | `~/.pm/pm-coder` | &mdash; | Override the session log root (mainly for tests). |
+| `--prompt-file PATH` | &mdash; | &mdash; | Read the auto-mode prompt from this file. |
+| `--run-id RUN_ID` | new session | &mdash; | Resume the session directory `<log-root>/<RUN_ID>`. |
+| `--log-root DIR` | `~/.pm/pm-coder` | &mdash; | Session log root. |
 | `--cwd DIR` | current dir | &mdash; | Working directory the agent acts inside. MCP/skill/instruction discovery walks up from here. |
 | `--base-url URL` | `http://127.0.0.1:8080/v1` | `LOCAL_AGENT_BASE_URL`, `OPENAI_BASE_URL` | OpenAI-compatible endpoint. |
 | `--api-key KEY` | `local` | `LOCAL_AGENT_API_KEY`, `OPENAI_API_KEY` | API key for the endpoint. |
-| `--model MODEL` | detected from `/models` | `LOCAL_AGENT_MODEL`, `OPENAI_MODEL` | Model id. Falls back to the first `/models` result, else `local`. |
-| `--mcp-config PATH` | auto-discover | &mdash; | MCP config file. Default discovery walks up looking for `.mcp.json`, `mcp.json`, `mcp_config.json`, `.pi/mcp.json`, `.codex/mcp.json`. |
+| `--model MODEL` | first `/models` entry | `LOCAL_AGENT_MODEL`, `OPENAI_MODEL` | Model id. When omitted, pm-coder waits for the endpoint and takes the first model it advertises. |
+| `--mcp-config PATH` | auto-discover | &mdash; | MCP config file. Discovery walks up looking for `.mcp.json`, `mcp.json`, `mcp_config.json`, `.pi/mcp.json`, `.codex/mcp.json`. |
 | `--shell {auto,powershell,bash}` | `auto` | `LOCAL_AGENT_SHELL` | Host shell tool. `auto` picks PowerShell on Windows, Bash elsewhere. |
-| `--shell-timeout SECS` (`--powershell-timeout`) | `180` | `LOCAL_AGENT_SHELL_TIMEOUT` | Seconds allowed for one host-shell tool call. |
-| `--max-tool-output N` | unlimited | `LOCAL_AGENT_MAX_TOOL_OUTPUT` | Cap on shell-tool output characters. |
-| `--max-skill-index N` | unlimited | `LOCAL_AGENT_MAX_SKILL_INDEX` | Cap on the skill-index characters injected into context. |
-| `--max-project-instructions N` | unlimited | `LOCAL_AGENT_MAX_PROJECT_INSTRUCTIONS` | Cap on instructions (AGENTS.md/CLAUDE.md) characters. |
-| `--skill NAME` | none | &mdash; | Load exactly one skill by name and inject its full `SKILL.md` into the system context before the user request. The generic skill index is replaced by that skill's body. |
-| `--auto-compact` | off | &mdash; | Compress long sessions. When estimated context exceeds `context-window - compact-reserve-tokens`, the older turns are summarized and only the most recent ~`compact-keep-recent-tokens` are kept verbatim. |
-| `--context-window N` | `65536` | `LOCAL_AGENT_CONTEXT_WINDOW` | Estimated model context window in tokens. Used only by `--auto-compact`. |
-| `--compact-reserve-tokens N` | `16384` | `LOCAL_AGENT_COMPACT_RESERVE` | Tokens reserved for the next response when deciding to compact (matches pi's default). |
-| `--compact-keep-recent-tokens N` | `16384` | `LOCAL_AGENT_COMPACT_KEEP_RECENT` | Approximate tokens of the most recent conversation kept verbatim after compaction (matches pi's default). |
+| `--shell-timeout SECS` | `240` | `LOCAL_AGENT_SHELL_TIMEOUT` | Seconds allowed for one host-shell tool call. `0` means no timeout. |
+| `--skill NAME_OR_PATH` | none | &mdash; | Load exactly one skill and inject its full `SKILL.md` into the system prompt, replacing the skill index. Accepts the skill's name or a path to its `SKILL.md`. |
+| `--context-window N` | `0` (ask the endpoint) | `LOCAL_AGENT_CONTEXT_WINDOW` | Token budget used to size compaction. `0` reads the endpoint's advertised `n_ctx` and subtracts a 2048-token safety margin; if the endpoint does not advertise one, 65536 is assumed. |
 | `--temperature T` | `0.7` | `LOCAL_AGENT_TEMPERATURE` | Sampling temperature. |
-| `--max-tokens N` | `8_192` | `LOCAL_AGENT_MAX_TOKENS` | Generated tokens per model response (excluding thinking and tool calls). Use `-1` to remove the client response limit. |
+| `--max-tokens N` | `8192` | `LOCAL_AGENT_MAX_TOKENS` | Generated tokens per model response. `0` lets the server decide. |
 | `--enable-thinking` / `--disable-thinking` | enabled | &mdash; | Allow or disable provider-specific long-form reasoning. |
-| `--prompt-file PATH` | &mdash; | &mdash; | Prompt source file. With `--artifact-dir` enables legacy one-shot/heartbeat mode. |
-| `--artifact-dir DIR` | &mdash; | &mdash; | Legacy one-shot output directory (with `--prompt-file`, `--request-limit`, `--wall-clock-limit`). |
-| `--request-limit N` | `0` (unlimited) | &mdash; | Maximum model requests for one turn, counting main-agent **and** compaction-summary calls. `0` = unlimited. |
-| `--wall-clock-limit SECS` | `0` (unlimited) | &mdash; | Maximum wall-clock time for one turn. `0` = unlimited. |
-| `-v` / `--verbose` | off | &mdash; | Debugging mode: print the raw model generation to stdout as it happens (thinking, text, and tool-call arguments exactly as they arrive), plus request/response markers and usage, and the auto-compaction trigger and summary. Useful for diagnosing hangs, retries, and truncated responses before anything is persisted. |
+| `-v` / `--verbose` | off | &mdash; | Print the raw model stream to stderr as it arrives: thinking, text, and tool-call arguments exactly as they come in, plus request markers and usage. Useful for diagnosing a hang before anything is persisted. |
 
-### `--auto-compact` details
+There are deliberately no request limits, wall-clock limits, or output caps.
+The agent is meant to be started once and left alone.
 
-Auto-compact mirrors the upstream pi coding agent's compaction settings and
-logic: default `compact-reserve-tokens` of `16384` and
-`compact-keep-recent-tokens` of `20000`. When the estimated in-context tokens
-exceed `context_window - compact_reserve_tokens`, pm-coder walks backward from
-the newest message accumulating estimated sizes, picks a cut point at the
-next fresh user-turn boundary (never mid-turn, never at a tool result), and
-already-compresses everything older into one structured checkpoint summary
-using a short, tool-less LLM pass. The summary is merged into the first kept
-user turn so the message stream stays alternating. A failed summarization
-never breaks the session: it logs a warning and leaves the history unchanged.
+## Recovery
 
-Compaction is off by default; pass `--auto-compact` to enable it. Because a
-model's true context window varies, set `--context-window` to match your
-model (for example `--context-window 131072` on an 128k model).
+Every model turn -- interactive or scripted -- goes through one function,
+`run_turn`, which has three failure policies and no exit condition:
+
+- **Out of context.** The endpoint rejected the request for length, or a
+  response came back truncated with the context above 75% full. The older
+  history is summarized into a checkpoint and the turn resumes from the last
+  tool result, so the model continues instead of restarting. Each compaction
+  that has to happen again immediately halves the verbatim context it
+  preserves; one that follows real progress starts over at full detail.
+- **Out of response budget.** A response was truncated (`finish_reason ==
+  "length"`) while the context still had room -- it simply outgrew
+  `--max-tokens`. Summarizing cannot fix that, so pm-coder does not: whatever
+  the model produced is kept, and it is told to continue from where it stopped
+  and to split large writes. A response that stopped *inside* a tool call is
+  dropped instead, since its arguments are incomplete.
+- **Anything else.** Connection refused, a restarted server, an HTTP error, a
+  model that changed underneath you: pm-coder prints
+  `<error>, trying reconnect...`, waits 30 seconds, and retries the same turn
+  from the work already captured. Tool calls that already ran are not repeated.
+
+Nothing but Ctrl-C ends the loop. Startup blocks the same way: if the endpoint
+is not up yet and the model id or context window still has to be discovered,
+pm-coder waits for it rather than starting against a server that is not there.
+
+Compaction has three strategies that escalate in order: summarize the interior
+of any single turn larger than 20% of the context window; otherwise keep whole
+turns at both ends and summarize the whole turns in between; otherwise collapse
+the largest turn down to its original request plus a checkpoint. Images in tool
+results are dropped first -- they are the cheapest thing to lose. If the
+summarizer itself runs out of context, its input is halved with overlap and
+summarized recursively.
+
+## Sessions
 
 Auto mode writes one JSON object to stdout:
 
 ```json
-{"response":"...","run_id":"2026-07-31_19-00-00_C_source_project","duration_seconds":12.34,"tokens_used":{"requests":1,"input_tokens":123,"output_tokens":45,"total_tokens":168}}
+{"response":"...","run_id":"2026-08-21_10-54-29_C_source_project","duration_seconds":12.34,"tokens_used":{"input_tokens":3413,"output_tokens":297,"requests":3,"tool_calls":2}}
 ```
 
-With `--verbose`, the raw model stream is also printed to stdout before this
-line (one marker per model request, then the generated content as it arrives).
-Pipe stdout elsewhere if the extra output breaks your consumer.
+Sessions live in `~/.pm/pm-coder/<run_id>/`:
 
-Sessions are stored in `~/.pm/pm-coder/<run_id>/`. The `messages.json` file
-contains Pydantic AI's structured model messages, not a summary or a second
-prompt. Pass `--run-id <run_id>` to continue a session. The same model,
-tokenizer, system instructions, tools, and chat-template settings reproduce
-the same logical prompt tokens. The llama.cpp server's private in-memory
-KV-cache cannot be persisted through the OpenAI-compatible API.
+- `messages.json` -- Pydantic AI's structured model messages, not a summary or
+  a second prompt. Replayed verbatim into `message_history`, so resuming does
+  not re-prompt anything. Pass `--run-id <run_id>` to continue. It is rewritten
+  **mid-turn**, after a tool call and at most every 30 seconds, so a turn that
+  runs all night survives a crash: kill the process at hour nine and
+  `--run-id` picks up from the last completed tool call.
+- `runs.jsonl` -- one line per completed turn.
+- `session.json` -- run metadata.
+- `<timestamp>_<n>.compact.json` / `.pretty.json` -- the exact body of every
+  `/chat/completions` request, captured below Pydantic AI's message and tool
+  conversion. One pair per request, so a long session produces a lot of them.
 
-Each session also contains `messages.yaml`, a human-readable rendering with
-120-character wrapping and Markdown content preserved in YAML block strings.
-Use `messages.json` for replay; use `messages.yaml` for inspection.
+With the same model, tokenizer, system instructions, tools, and chat-template
+settings, a resumed session sends the same logical prompt tokens. The llama.cpp
+server's private in-memory KV cache cannot be persisted through the
+OpenAI-compatible API.
 
-The agent uses the local OpenAI-compatible endpoint at
-`http://127.0.0.1:8080/v1` with the `qwen` model by default. Use command-line
-options to select a model, working directory, MCP configuration, shell, and
-execution limits.
-
-The default response limit is 8,192 generated tokens. Use `--max-tokens` to
-change it. Use `--max-tokens -1` to remove the client response limit.
-
-Auto and interactive modes recover when a response reaches the client limit.
-The agent removes the incomplete response and asks the model to use shorter
-tool calls. It uses the completed message and repository state from before the
-failure. It also recovers from a known malformed tool-call HTTP 500 response.
-
-Connection failures and restart-class HTTP responses use exponential retry.
-The failed endpoint request does not use the agent request budget. The same
-wall-clock limit still applies. A real model-context error ends the turn so the
-workflow kernel can start a fresh attempt.
-
-Interactive commands include `/clear`, `/info`, `/paste`, and `/quit`.
+Interactive commands: `/clear`, `/info`, `/paste`, `/quit`.
 
 ## Minecraft example (pm-minecraft)
 
 Point pm-coder at a pm-minecraft character workspace (e.g. `C:/Temp/Floppa`).
 pm-coder auto-discovers that workspace's `.mcp.json`, connects to the
 `minecraft` MCP server, and lets the model drive the body while reading
-screenshots it captures. Run it in single-shot auto mode to have the agent
-observe its surroundings and report what it sees:
+screenshots it captures:
 
 ```powershell
 pm-coder --mode auto `
   --cwd C:/Temp/Floppa `
-  --request-limit 30 `
-  --wall-clock-limit 480 `
-  "Use the minecraft MCP server. Start with minecraft_observe(include_image=true) to actually look at the screenshot of your surroundings. Scan for a village or any villager. If none is visible from here, say so clearly and describe exactly what you can see, then stop. Use normal survival mechanics only."
+  "Use the minecraft MCP server. Start with minecraft_observe(include_image=true) to actually look at the screenshot of your surroundings. Get a diamond. Use normal survival mechanics only."
 ```
 
 - `--cwd C:/Temp/Floppa` makes pm-coder discover `C:/Temp/Floppa/.mcp.json`
   automatically (no `--mcp-config` needed).
-- The `minecraft` server's `requestTimeoutMs` (200000 in the character
-default) is the ceiling for one long-running body/skill call, so keep the
-  prompt's own limits generous; `minecraft_observe` with `include_image=true`
-  returns image pixels that a multimodal model can inspect directly.
-- The workspace's `AGENTS.md` and its `drafts/find_village.ts` teach the model
-  the exact tool shapes and safe exploration habits.
+- `minecraft_observe` with `include_image=true` returns image pixels a
+  multimodal model can inspect directly. Those images are the first thing
+  compaction discards when context runs low.
+- The workspace's `AGENTS.md` and its `drafts/*.ts` teach the model the exact
+  tool shapes and safe exploration habits.
+- The MCP connection is opened once and held for the whole session. A model
+  endpoint that dies and comes back does not disturb it, so the bot is not
+  kicked from the world every time llama.cpp restarts.
 
 ## Python API
 
-`run_auto` has the same behavior as auto CLI mode and returns the JSON-compatible
-result dictionary. Reuse its `run_id` for a continuing conversation:
+`run_auto` has the same behavior as auto CLI mode and returns the result as a
+plain dictionary. Reuse its `run_id` for a continuing conversation:
 
 ```python
-from pm_coder import run_auto_sync
+from pm_coder import run_auto
 
 run_id = None
 while True:
     prompt = input("You> ")
     if not prompt:
         break
-    result = run_auto_sync(prompt, run_id=run_id)
+    result = run_auto(prompt, run_id=run_id)
     run_id = result["run_id"]
     print(result["response"])
 ```
 
-Use `async_run_auto` from an existing asyncio application.
+`run_auto` owns the event loop and returns a dictionary, so callers never touch
+asyncio. Use `async_run_auto` from an existing asyncio application; it returns
+a `TurnResult`.
 
-`run_auto` is also synchronous; `run_auto_sync` is provided as an explicit
-name for callers that want to make the threading boundary clear. Passing
-`auto_compact=True`, `skill="..."`, `context_window=...`,
-`compact_reserve_tokens=...`, `compact_keep_recent_tokens=...`, and
-`verbose=True` to `run_auto` / `run_auto_sync` enables the same behaviors as
-the matching CLI flags (`verbose=True` prints the raw model stream to
-`sys.stdout` as it happens).
+Both accept the same keywords as the CLI flags -- `cwd`, `base_url`, `api_key`,
+`model`, `mcp_config`, `shell`, `shell_timeout`, `temperature`, `max_tokens`,
+`enable_thinking`, `skill`, `verbose`, `context_window` -- plus `run_id` and
+`log_root`.
 
-Asyncio is fully opt-in for callers. `run_auto` and `run_auto_sync` run the
-whole session (including any auto-compaction) inside a loop they own and
-return a plain dictionary; you never touch an event loop. Only
-`async_run_auto` exposes the coroutine-based API for embedding in an existing
-asyncio application.
+To run many turns against one live agent and one MCP connection, use
+`open_session` directly:
+
+```python
+import asyncio
+from pm_coder import build_settings, open_session, run_turn
+
+async def main():
+    settings = build_settings(cwd="C:/Temp/Floppa")
+    async with open_session(settings) as (agent, discovery, store):
+        while True:
+            await run_turn(agent, settings, store, "keep mining until you find diamonds")
+
+asyncio.run(main())
+```
+
 
 ## Development
 
 ```powershell
-python -m pip install -e ".[dev]"
-pytest
+python -m pip install -e "."
 ```
+
+There is no test suite. The agent is verified by running it.
+
