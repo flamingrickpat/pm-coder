@@ -8,6 +8,9 @@ has three failure policies and no exit condition:
   -> summarize older history into a checkpoint and resume where we left off;
 * a response outgrew --max-tokens with context to spare
   -> keep what it wrote and tell it to continue;
+* the endpoint could not use what the model produced (a tool call whose JSON
+  never parsed) -> retry, and once that has failed twice running, retry as a
+  fresh user turn so the request is not byte-identical;
 * anything else
   -> print it, wait, and retry the same turn.
 
@@ -1571,6 +1574,8 @@ TRUNCATION_FEEDBACK = (
     "one enormous `write`."
 )
 
+FAKE_USER_RESUME = "/resume"
+
 CONTEXT_RECOVERY_PROMPT = (
     "The earlier conversation reached the model context window and was "
     "summarized into the checkpoint above. Continue the CURRENT task from that "
@@ -1594,19 +1599,40 @@ CONTEXT_MARKERS = (
     "too many tokens",
     "reduce prompt",
     "n_ctx",
-    # A tool-call payload whose JSON never terminated is a generation that ran
-    # out of room mid-argument, which is the same problem wearing a hat.
-    "failed to parse tool call arguments as json",
 )
 
+# Errors that mean the endpoint rejected what the model *produced*, not what we
+# sent. llama.cpp answers 500 when the tool call the model emitted is not
+# parsable JSON; that happens at any context size, while a genuine out-of-room
+# rejection is a 4xx carrying one of the markers above. Reading it as "no room"
+# cost a session its history once: a 4,798-token conversation was compacted to
+# 545 tokens, because the forced path skips the size check.
+GENERATION_FAILURE_MARKERS = ("failed to parse", "as json",)
 
-def is_context_failure(exc: BaseException) -> bool:
-    """True when an exception means "no room left", however it was phrased."""
+
+def error_text(exc: BaseException) -> str:
+    """Flattened message plus response body, folded, for marker matching."""
     text = " ".join(str(exc).split()).casefold()
     body = getattr(exc, "body", None)
     if body is not None:
         text += " " + json.dumps(body, default=str).casefold()
-    return any(marker in text for marker in CONTEXT_MARKERS)
+    return text
+
+
+def is_context_failure(exc: BaseException) -> bool:
+    """True when an exception means "no room left", however it was phrased."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status >= 500:
+        # A server fault is never the endpoint saying the prompt is too long --
+        # that rejection is a 4xx -- and this answer forces a compaction past
+        # every size check, so a 500 must not be able to reach it.
+        return False
+    return any(marker in error_text(exc) for marker in CONTEXT_MARKERS)
+
+
+def is_generation_failure(exc: BaseException) -> bool:
+    """True when the model's own output was unusable, whatever the room left."""
+    return any(marker in error_text(exc) for marker in GENERATION_FAILURE_MARKERS)
 
 
 def has_unanswered_tool_call(message: Any) -> bool:
@@ -2007,13 +2033,19 @@ async def run_turn(
             # repeating side effects; Pydantic AI closes any dangling call.
             history = list(captured) or history
             session.save_messages(history)
-            if is_context_failure(exc) or hit_generation_limit(history):
+
+            if is_generation_failure(exc):
+                # just add a fake user turn and hope the model generates something better
+                next_prompt = FAKE_USER_RESUME
+            elif is_context_failure(exc) or hit_generation_limit(history):
+                # compact
                 next_prompt = await recover(
                     f"out of room ({type(exc).__name__})",
                     # The endpoint refusing the request outranks our estimate.
                     force_compact=is_context_failure(exc),
                 )
             else:
+                # reconnect
                 note(f"{type(exc).__name__}: {exc}, trying reconnect...")
                 next_prompt = resume_prompt(history, prompt)
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
