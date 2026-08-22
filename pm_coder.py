@@ -9,7 +9,9 @@ has three failure policies and no exit condition:
 * a response outgrew --max-tokens with context to spare
   -> keep what it wrote and tell it to continue;
 * the endpoint could not use what the model produced (a tool call whose JSON
-  never parsed) -> retry, and once that has failed twice running, retry as a
+  never parsed, or tool arguments it failed to repair until pydantic-ai's
+  retries ran out)
+  -> retry, and once that has failed twice running, retry as a
   fresh user turn so the request is not byte-identical;
 * anything else
   -> print it, wait, and retry the same turn.
@@ -1801,6 +1803,35 @@ def is_generation_failure(exc: BaseException) -> bool:
     return any(marker in error_text(exc) for marker in GENERATION_FAILURE_MARKERS)
 
 
+# pydantic-ai feeds a tool's validation error back to the model as a retry
+# prompt, and raises UnexpectedModelBehavior once the same tool has failed its
+# `retries` times in a row -- the model read the feedback and still emitted
+# the same bad arguments. Both phrasings below are pydantic-ai's own; unlike
+# urllib3's "max retries exceeded with url", they are about the model's
+# output, not the transport.
+RETRY_EXHAUSTION_MARKERS = (
+    "exceeded max retries count",       # tool arguments failed validation
+    "exceeded maximum output retries",   # output validators rejected the reply
+)
+
+
+def is_retry_exhaustion(exc: BaseException) -> bool:
+    """True when the model burned every chance to repair its own output."""
+    return any(marker in error_text(exc) for marker in RETRY_EXHAUSTION_MARKERS)
+
+
+def is_model_intelligence_failure(exc: BaseException) -> bool:
+    """True when the model is stuck on output it cannot fix itself.
+
+    Two shapes, one cause: a generation the endpoint could not parse, or tool
+    arguments the model kept emitting despite the validation error being fed
+    back to it. Both are probability traps -- resampling the same history at
+    low temperature reproduces the same mistake -- so both want the same cure:
+    a fresh user turn to shift the distribution, never a retry as-is.
+    """
+    return is_generation_failure(exc) or is_retry_exhaustion(exc)
+
+
 def has_unanswered_tool_call(message: Any) -> bool:
     return isinstance(message, ModelResponse) and any(
         type(part).__name__ == "ToolCallPart" for part in message.parts
@@ -2153,6 +2184,8 @@ async def run_turn(
     * out of context -> compact the history and resume from the last tool
       result;
     * a response truncated with context to spare -> keep it and continue;
+    * the model stuck on its own output (unparseable generation, or arguments
+      it cannot repair) -> nudge it with a fresh user turn;
     * anything else -> say so, wait, and retry the same turn.
 
     The agent must already be entered (``async with agent``) so MCP servers
@@ -2219,8 +2252,18 @@ async def run_turn(
             history = list(captured) or history
             session.save_messages(history)
 
-            if is_generation_failure(exc):
-                # just add a fake user turn and hope the model generates something better
+            if is_model_intelligence_failure(exc):
+                # The model is wedged on output it cannot fix: a generation
+                # the endpoint could not parse, or tool arguments it emitted
+                # byte-identical despite the validation error being fed
+                # back. Retrying the same history resamples the same
+                # distribution, so inject a user turn to move it. The
+                # failure can leave the last call without a result -- retry
+                # exhaustion raises before one is appended -- and no new
+                # prompt may follow such a call, so trim it. The error
+                # feedback from the attempts that did land stays visible.
+                history = drop_unanswered_tail(history)
+                session.save_messages(history)
                 next_prompt = FAKE_USER_RESUME
             elif is_context_failure(exc) or hit_generation_limit(history):
                 # compact
@@ -2230,7 +2273,15 @@ async def run_turn(
                     force_compact=is_context_failure(exc),
                 )
             else:
-                # reconnect
+                # reconnect. The exception may have struck between the model
+                # emitting a tool call and that call's result landing;
+                # resume_prompt would then answer the dangling call with a
+                # fresh prompt, which pydantic-ai rejects -- and keeps
+                # rejecting, because every retry rebuilds the same history.
+                # Trim the call so the resume continues from the last real
+                # result instead of tripping over the stub.
+                history = drop_unanswered_tail(history)
+                session.save_messages(history)
                 note(f"{type(exc).__name__}: {exc}, trying reconnect...")
                 next_prompt = resume_prompt(history, prompt)
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
