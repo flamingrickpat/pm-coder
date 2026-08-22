@@ -41,12 +41,13 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping, Sequence
 from xml.sax.saxutils import escape, quoteattr
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent, Tool, UsageLimits, capture_run_messages
+from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.mcp import load_mcp_toolsets
 from pydantic_ai.messages import (
     BinaryContent,
@@ -57,7 +58,7 @@ from pydantic_ai.messages import (
     TextPartDelta,
     ThinkingPartDelta,
     ToolCallPartDelta,
-    UserPromptPart,
+    UserPromptPart, is_multi_modal_content, ToolReturnPart, ModelMessage, UploadedFile, ImageUrl,
 )
 from pydantic_ai.models import OpenAIChatCompatibleProvider, StreamedResponse
 from pydantic_ai.models.openai import (
@@ -92,10 +93,16 @@ DEFAULT_CONTEXT_WINDOW = 0
 CONTEXT_SAFETY_MARGIN = 2_048
 FALLBACK_CONTEXT_WINDOW = 65_536
 
-# Tokens of verbatim conversation preserved at each edge of a compaction.
-# Halved on every consecutive recovery, so repeated compactions of the same
-# history keep converging instead of stalling.
-EDGE_TOKENS = 2_048
+# Fraction of the pre-compaction history a compaction keeps verbatim, split
+# across its two edges. A first compaction should land at roughly half the
+# size it started from (90k -> ~45k), not at a fixed few thousand tokens
+# that vaporize an all-night session's detail. Consecutive recoveries still
+# halve whatever was chosen, so a history that keeps overflowing keeps
+# converging instead of stalling.
+COMPACT_KEEP_FRACTION = 0.5
+# Per-edge cap relative to the context window: the verbatim edges plus the
+# checkpoint summary must leave room for the next generation to run.
+EDGE_WINDOW_FRACTION = 0.25
 MIN_EDGE_TOKENS = 256
 # Growth since the previous compaction that counts as the model having done
 # real work, rather than having overflowed again straight away.
@@ -118,6 +125,17 @@ SNAPSHOT_SECONDS = 30.0
 # as the context running out. Below it, the response merely outgrew
 # --max-tokens, and summarizing would throw away detail for nothing.
 COMPACT_ABOVE = 0.75
+
+# Images are pruned from the stored history with a high/low watermark. While
+# the history holds at most IMAGE_HIGH_WATER images nothing is touched, so
+# consecutive requests differ only by appended messages and prefix caches
+# keep hitting; past the watermark, all but the newest IMAGE_LOW_WATER images
+# are swapped for placeholders. Swapping content -- never deleting messages --
+# keeps every tool-call/tool-return pair intact, so the pruned history can
+# never end in unprocessed tool calls.
+IMAGE_HIGH_WATER = 32
+IMAGE_LOW_WATER = 8
+OMITTED = "[older image omitted]"
 
 MCP_CONFIG_CANDIDATES = (
     ".mcp.json",
@@ -192,6 +210,114 @@ def load_yaml(raw: str) -> Any:
 # Session storage
 # ---------------------------------------------------------------------------
 
+def _is_image(x) -> bool:
+    return (
+        isinstance(x, ImageUrl)
+        or isinstance(x, (BinaryContent, UploadedFile))
+        and x.media_type.startswith("image/")
+    )
+
+
+def count_images(messages: list[ModelMessage]) -> int:
+    """Images anywhere in request content, including nested tool returns."""
+
+    def walk(x) -> int:
+        if _is_image(x):
+            return 1
+        if isinstance(x, Mapping):
+            return sum(walk(v) for v in x.values())
+        if isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray)):
+            return sum(walk(v) for v in x)
+        return 0
+
+    total = 0
+    for msg in messages:
+        if not isinstance(msg, ModelRequest):
+            continue
+        for part in msg.parts:
+            if isinstance(part, UserPromptPart) or (
+                isinstance(part, ToolReturnPart) and part.tool_kind is None
+            ):
+                total += walk(part.content)
+    return total
+
+
+def _omit_older_images(messages: list[ModelMessage], keep: int) -> list[ModelMessage]:
+    """Swap every image but the newest ``keep`` for an OMITTED placeholder."""
+
+    kept = 0
+
+    # Walk content newest -> oldest.
+    def prune(x):
+        nonlocal kept
+
+        if _is_image(x):
+            if kept < keep:
+                kept += 1
+                return x
+            return OMITTED
+
+        # Tool returns can contain arbitrarily nested multimodal data.
+        if isinstance(x, Mapping):
+            rev = [(k, prune(v)) for k, v in reversed(x.items())]
+            return dict(reversed(rev))
+
+        if isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray)):
+            return list(reversed([prune(v) for v in reversed(x)]))
+
+        return x
+
+    result = []
+
+    # Messages also need to be processed newest -> oldest.
+    for msg in reversed(messages):
+        if not isinstance(msg, ModelRequest):
+            result.append(msg)
+            continue
+
+        parts = list(msg.parts)
+        changed = False
+
+        for i in range(len(parts) - 1, -1, -1):
+            part = parts[i]
+
+            if isinstance(part, UserPromptPart):
+                new_content = prune(part.content)
+
+            elif isinstance(part, ToolReturnPart) and part.tool_kind is None:
+                new_content = prune(part.content)
+
+            else:
+                continue
+
+            parts[i] = replace(part, content=new_content)
+            changed = True
+
+        result.append(replace(msg, parts=parts) if changed else msg)
+
+    return list(reversed(result))
+
+
+def keep_recent_images(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """High/low watermark image pruner for the history Pydantic AI stores.
+
+    Runs as a ``ProcessHistory`` capability, and Pydantic AI writes the
+    processed list back into the run's message history (the same list our
+    mid-turn snapshots persist), so this edits the stored history, not just
+    one outgoing request -- which is what makes the watermark stick.
+
+    While the history holds at most ``IMAGE_HIGH_WATER`` images the list is
+    returned untouched, so consecutive requests differ only by appended
+    messages and prefix caches keep hitting. Past the watermark, all but the
+    newest ``IMAGE_LOW_WATER`` images become placeholders -- a content swap,
+    never a message removal, so tool-call/tool-return pairing survives and
+    the history can never end in unprocessed tool calls.
+    """
+    total = count_images(messages)
+    if total <= IMAGE_HIGH_WATER:
+        return messages
+    note(f"{total} images in history; keeping the newest {IMAGE_LOW_WATER}")
+    return _omit_older_images(messages, IMAGE_LOW_WATER)
 
 class SessionStore:
     """One conversation on disk as Pydantic AI model messages.
@@ -1472,6 +1598,9 @@ def build_agent(
             parallel_tool_calls=False,
             extra_body=thinking_body(settings),
         ),
+        capabilities=[
+            ProcessHistory(keep_recent_images),
+        ],
         retries=3,
         max_concurrency=1,
     )
@@ -1855,6 +1984,10 @@ async def compact_one_turn(
     to that response, which keeps every tool-call/tool-return pair intact.
     """
     cuts = [index for index, message in enumerate(turn) if isinstance(message, ModelResponse)]
+    # A turn smaller than both edges cannot keep them verbatim; quarter the
+    # turn instead so this still lands near half its size rather than
+    # falling through to collapse_largest_turn's request-plus-summary.
+    edge_tokens = min(edge_tokens, max(MIN_EDGE_TOKENS, count_tokens(turn) // 4))
     head_cuts = [index for index in cuts if count_tokens(turn[:index]) >= edge_tokens]
     tail_cuts = [index for index in cuts if count_tokens(turn[index:]) >= edge_tokens]
     if not head_cuts or not tail_cuts:
@@ -1925,14 +2058,30 @@ async def collapse_largest_turn(settings: Settings, history: list[Any]) -> list[
 
 
 async def compact(settings: Settings, history: list[Any], recoveries: int) -> list[Any]:
-    """Shrink one history, preserving as much recent detail as still fits."""
-    edge_tokens = max(MIN_EDGE_TOKENS, EDGE_TOKENS // (2**recoveries))
+    """Shrink one history, preserving as much recent detail as still fits.
+
+    The verbatim edges are sized from the history being compacted -- roughly
+    half of it survives a first compaction -- instead of a fixed few thousand
+    tokens. A fixed budget turned a 90k-token all-night session into 8k in
+    one step; proportional edges turn it into ~45k, and the escalation in
+    ``run_turn.recover`` still halves them whenever that proves too generous.
+    """
     history = strip_images(list(history))
     # A truncated trailing response is the thing that just failed. Dropping it
     # leaves the history ending in tool results, which lets the model resume
     # generating from exactly where it ran out of room.
     while history and isinstance(history[-1], ModelResponse):
         history.pop()
+
+    before = count_tokens(history)
+    edge_tokens = max(
+        MIN_EDGE_TOKENS,
+        min(
+            int(before * COMPACT_KEEP_FRACTION) // 2,
+            int(settings.context_window * EDGE_WINDOW_FRACTION),
+        )
+        // (2**recoveries),
+    )
 
     # First: kill fat turns. One completed 30k-token coding turn must not
     # permanently consume 30k tokens of every future request.
@@ -1989,7 +2138,6 @@ def resume_prompt(history: list[Any], fallback: str) -> str | None:
     if history and isinstance(history[-1], ModelRequest):
         return None
     return fallback
-
 
 async def run_turn(
     agent: Agent[Any, str],

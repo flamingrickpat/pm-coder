@@ -1,0 +1,1 @@
+pip install -e C:\source\pm\pm-coder
