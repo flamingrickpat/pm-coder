@@ -1838,6 +1838,34 @@ def has_unanswered_tool_call(message: Any) -> bool:
     )
 
 
+def is_unprocessed_tool_calls_error(exc: Exception) -> bool:
+    """Exactly pydantic-ai's refusal to take a prompt over a dangling tool call."""
+    return "unprocessed tool calls" in str(exc)
+
+
+def drop_last_tool_call(history: list[Any]) -> list[Any]:
+    """Remove the newest tool call from the last assistant message with one.
+
+    The message itself is kept -- its text is real work -- unless nothing
+    but the tool call remains, in which case it goes too.
+    """
+    history = list(history)
+    for i in range(len(history) - 1, -1, -1):
+        message = history[i]
+        if isinstance(message, ModelResponse) and any(
+            type(part).__name__ == "ToolCallPart" for part in message.parts
+        ):
+            kept = [
+                part for part in message.parts if type(part).__name__ != "ToolCallPart"
+            ]
+            if kept:
+                history[i] = replace(message, parts=kept)
+            else:
+                history.pop(i)
+            break
+    return history
+
+
 def drop_unanswered_tail(history: list[Any]) -> list[Any]:
     """Remove a trailing response that ends in a tool call nobody answered.
 
@@ -2251,6 +2279,14 @@ async def run_turn(
             # repeating side effects; Pydantic AI closes any dangling call.
             history = list(captured) or history
             session.save_messages(history)
+
+            if is_unprocessed_tool_calls_error(exc):
+                # The endpoint refused the prompt because a tool call sits
+                # unanswered in the history. Cut that call off and retry.
+                history = drop_last_tool_call(history)
+                session.save_messages(history)
+                next_prompt = resume_prompt(history, prompt)
+                continue
 
             if is_model_intelligence_failure(exc):
                 # The model is wedged on output it cannot fix: a generation
