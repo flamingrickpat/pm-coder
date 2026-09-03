@@ -1341,19 +1341,19 @@ wheels = [
 
 [[package]]
 name = "pm-coder"
-version = "0.3.0"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "just-bash" },
     { name = "pydantic" },
     { name = "pydantic-ai-slim", extra = ["mcp", "openai"] },
-    { name = "pytest" },
     { name = "ruamel-yaml" },
 ]
 
 [package.optional-dependencies]
 dev = [
     { name = "build" },
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -1362,7 +1362,7 @@ requires-dist = [
     { name = "just-bash", specifier = ">=0.2.0" },
     { name = "pydantic", specifier = ">=2.9,<3" },
     { name = "pydantic-ai-slim", extras = ["openai", "mcp"], specifier = ">=2,<3" },
-    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.1.1" },
     { name = "ruamel-yaml", specifier = ">=0.18,<1" },
 ]
 provides-extras = ["dev"]

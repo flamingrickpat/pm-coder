@@ -82,6 +82,7 @@ APP_NAME = "pm-coder"
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_LOG_ROOT = Path("~/.pm/pm-coder").expanduser()
 DEFAULT_SHELL_TIMEOUT = 240
+SHELL_TERMINATE_GRACE_SECONDS = 2.0
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 8_192
 
@@ -832,54 +833,109 @@ def shell_backend(settings: Settings) -> ShellBackend:
     return BashBackend(settings.shell_executable)
 
 
+def _terminate_shell_wrapper(process: subprocess.Popen[bytes]) -> bool:
+    """Kill and reap one shell wrapper without introducing another open-ended wait."""
+    if process.poll() is not None:
+        return True
+    with suppress(OSError):
+        process.kill()
+    try:
+        process.wait(timeout=SHELL_TERMINATE_GRACE_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return True
+
+
+def _capture_bytes(capture: Any) -> str:
+    """Read the current contents of a seekable binary capture file."""
+    capture.seek(0)
+    return capture.read().decode("utf-8", errors="replace")
+
+
+def _run_host_shell(
+    backend: ShellBackend,
+    cwd: Path,
+    command: str,
+    timeout_seconds: int,
+) -> str:
+    """Run one shell script with a timeout that cannot be held open by descendants.
+
+    Pipes are deliberately not used here. On Windows a background descendant can
+    inherit a pipe handle after the shell wrapper exits. ``subprocess.run`` then
+    waits for pipe EOF, and its timeout cleanup performs another unbounded
+    ``communicate()``. Seekable temporary files let us wait only on the wrapper's
+    process handle and read whatever output exists after that bounded wait.
+    """
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be greater than zero")
+    script_path: str | None = None
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=backend.file_suffix,
+            prefix="pm_coder_worker_",
+            encoding=backend.file_encoding,
+            delete=False,
+        ) as script_file:
+            script_file.write(backend.preamble + command)
+            script_path = script_file.name
+
+        with (
+            tempfile.TemporaryFile() as stdout_capture,
+            tempfile.TemporaryFile() as stderr_capture,
+        ):
+            process = subprocess.Popen(
+                backend.invocation(script_path),
+                cwd=cwd,
+                env=os.environ.copy(),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_capture,
+                stderr=stderr_capture,
+            )
+            try:
+                returncode = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                terminated = _terminate_shell_wrapper(process)
+                stdout = _capture_bytes(stdout_capture)
+                stderr = _capture_bytes(stderr_capture)
+                detail = "" if terminated else "wrapper_terminated: false\n"
+                return (
+                    "timed_out: true\n"
+                    f"timeout_seconds: {timeout_seconds}\n"
+                    f"{detail}"
+                    f"stdout_before_timeout:\n{stdout or '(empty)'}\n"
+                    f"stderr_before_timeout:\n{stderr or '(empty)'}"
+                )
+
+            stdout = _capture_bytes(stdout_capture)
+            stderr = _capture_bytes(stderr_capture)
+            return (
+                f"exit_code: {returncode}\n"
+                f"stdout:\n{stdout or '(empty)'}\n"
+                f"stderr:\n{stderr or '(empty)'}"
+            )
+    finally:
+        if process is not None and process.poll() is None:
+            _terminate_shell_wrapper(process)
+        if script_path is not None:
+            with suppress(OSError):
+                os.remove(script_path)
+
+
 def make_shell_tool(settings: Settings) -> Tool[Any]:
     backend = shell_backend(settings)
 
     def host_shell(command: str, timeout_seconds: int = settings.shell_timeout) -> str:
         """Execute a host-shell script in the selected agent workspace."""
         print(f"\n[{backend.kind}]\n{command.rstrip()}", file=sys.stderr, flush=True)
-        timeout = None if timeout_seconds <= 0 else timeout_seconds
-        script_path: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=backend.file_suffix,
-                prefix="pm_coder_worker_",
-                encoding=backend.file_encoding,
-                delete=False,
-            ) as script_file:
-                script_file.write(backend.preamble + command)
-                script_path = script_file.name
-            completed = subprocess.run(
-                backend.invocation(script_path),
-                cwd=settings.cwd,
-                env=os.environ.copy(),
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-            )
-            stdout = completed.stdout.decode("utf-8", errors="replace")
-            stderr = completed.stderr.decode("utf-8", errors="replace")
-            print(f"[{backend.kind} exit {completed.returncode}]", file=sys.stderr, flush=True)
-            return (
-                f"exit_code: {completed.returncode}\n"
-                f"stdout:\n{stdout or '(empty)'}\n"
-                f"stderr:\n{stderr or '(empty)'}"
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = (exc.stdout or b"").decode("utf-8", errors="replace")
-            stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
+        result = _run_host_shell(backend, settings.cwd, command, timeout_seconds)
+        if result.startswith("timed_out: true"):
             print(f"[{backend.kind} timed out]", file=sys.stderr, flush=True)
-            return (
-                "timed_out: true\n"
-                f"timeout_seconds: {timeout_seconds}\n"
-                f"stdout_before_timeout:\n{stdout or '(empty)'}\n"
-                f"stderr_before_timeout:\n{stderr or '(empty)'}"
-            )
-        finally:
-            if script_path is not None:
-                with suppress(OSError):
-                    os.remove(script_path)
+        else:
+            match = re.match(r"exit_code: (-?\d+)", result)
+            print(f"[{backend.kind} exit {match.group(1)}]", file=sys.stderr, flush=True)
+        return result
 
     return Tool(
         host_shell,
