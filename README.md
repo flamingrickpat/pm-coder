@@ -17,7 +17,10 @@ Install the latest repository version in another project:
 python -m pip install --upgrade "pm-coder @ git+https://github.com/flamingrickpat/pm-coder"
 ```
 
-The package installs the `pm-coder` command and the `pm_coder` Python module.
+The package installs the `pm-coder` command and the `pm_coder` and
+`pm_bash_machine` Python modules, so you can also drive the agent from your
+own code -- see [Python API](#python-api) and
+[In-Memory Bash Machine](#in-memory-bash-machine) below.
 
 ## Run
 
@@ -259,13 +262,8 @@ asyncio.run(main())
 
 `BashMachine` gives LLM agents a shared Bash workspace that exists only in Python memory.
 
-It uses `just-bash-py`. It does not start Docker, Node.js, Bash, or another operating-system process.
-
-Install the dependency:
-
-```bash
-pip install just-bash
-```
+It uses `just-bash-py`, which pip installs automatically as a dependency of
+the `pm-coder` package.
 
 ### Basic use
 
@@ -533,8 +531,8 @@ Symbolic and hard links are disabled in user shells because path aliases can byp
 ## Development
 
 ```powershell
-python -m pip install -e "."
+python -m pip install -e ".[dev]"
+python -m pytest -v test_bash_machine.py   # offline, no endpoint needed
+python -m pytest -v test_llm_coder.py      # needs a live OpenAI-compatible endpoint
 ```
-
-There is no test suite. The agent is verified by running it.
 

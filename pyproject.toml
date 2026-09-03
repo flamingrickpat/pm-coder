@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pm-coder"
-version = "0.3.1"
+version = "0.4.0"
 description = "An unattended coding agent for local OpenAI-compatible models"
 readme = "README.md"
 license = "MIT"
@@ -14,16 +14,16 @@ dependencies = [
     "pydantic-ai-slim[openai,mcp]>=2,<3",
     "ruamel.yaml>=0.18,<1",
     "just-bash>=0.2.0",
-    "pytest>=9.1.1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "build>=1,<2",
+    "pytest>=9.1.1",
 ]
 
 [project.scripts]
 pm-coder = "pm_coder:main"
 
 [tool.setuptools]
-py-modules = ["pm_coder"]
+py-modules = ["pm_coder", "pm_bash_machine"]

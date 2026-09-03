@@ -58,6 +58,8 @@ from typing import Any, Mapping
 from just_bash import Bash
 from just_bash.fs import InMemoryFs
 
+__all__ = ["Access", "AccessSpec", "BashMachine", "BashResult"]
+
 
 class Access(StrEnum):
     N = auto()

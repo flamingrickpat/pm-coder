@@ -151,6 +151,42 @@ FRONTMATTER_RE = re.compile(r"\A---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", re.DOTA
 # Unlimited must be spelled out: UsageLimits() alone defaults to 50 requests.
 NO_LIMITS = UsageLimits(request_limit=None)
 
+# The library surface. Everything here can be imported and used without the
+# CLI; anything not listed is an internal detail and may change.
+__all__ = [
+    "DiscoveryResult",
+    "SessionStore",
+    "Settings",
+    "Skill",
+    "TurnResult",
+    "async_run_auto",
+    "async_run_auto_with_bash_machine",
+    "build_agent",
+    "build_settings",
+    "build_summary_agent",
+    "build_system_prompt",
+    "compact",
+    "discover_workspace",
+    "find_mcp_config",
+    "find_skill",
+    "load_skills",
+    "make_bash_machine_tool",
+    "make_file_tools",
+    "make_shell_tool",
+    "make_virtual_file_tools",
+    "open_bash_machine_session",
+    "open_session",
+    "probe_endpoint",
+    "prompt_text",
+    "run_auto",
+    "run_auto_with_bash_machine",
+    "run_turn",
+    "select_shell",
+    "shell_backend",
+    "summarize",
+    "wait_for_endpoint",
+]
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
