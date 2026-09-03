@@ -255,6 +255,280 @@ async def main():
 asyncio.run(main())
 ```
 
+## In-Memory Bash Machine
+
+`BashMachine` gives LLM agents a shared Bash workspace that exists only in Python memory.
+
+It uses `just-bash-py`. It does not start Docker, Node.js, Bash, or another operating-system process.
+
+Install the dependency:
+
+```bash
+pip install just-bash
+```
+
+### Basic use
+
+```python
+from pm_bash_machine import BashMachine
+
+vm = BashMachine()
+
+vm.exec("user", "mkdir -p project && cd project").check()
+vm.exec("user", "echo alpha > notes.txt").check()
+vm.exec("user", "echo beta >> notes.txt").check()
+
+result = vm.exec("user", "grep -n alpha notes.txt")
+print(result.stdout)
+```
+
+The virtual filesystem stays available for the lifetime of the `BashMachine` object.
+
+The current directory and exported environment variables also persist for each user.
+
+### Shared users
+
+The machine has a `user` user by default.
+
+Add more users with `add_user()`:
+
+```python
+vm.add_user("floppa")
+vm.add_user("critic")
+```
+
+All users see the same virtual filesystem.
+
+Each user has a separate current directory and shell environment.
+
+```python
+vm.exec("user", "cd /shared")
+vm.exec("floppa", "cd /scratch")
+
+print(vm.exec("user", "pwd").stdout)
+print(vm.exec("floppa", "pwd").stdout)
+```
+
+### File access
+
+Use `Access` to control file access.
+
+```python
+from pm_bash_machine import Access
+```
+
+The available values are:
+
+* `Access.N` — the user cannot read or modify the file.
+* `Access.R` — the user can read the file but cannot modify it.
+* `Access.RW` — the user can read and modify the file.
+
+Files use `Access.RW` by default.
+
+```python
+vm.write_text("/shared/public.md", "hello")
+
+vm.write_text(
+    "/shared/reference.md",
+    "read only",
+    access=Access.R,
+)
+
+vm.write_text(
+    "/shared/private.md",
+    "secret",
+    access=Access.N,
+)
+```
+
+You can also give different access to different users:
+
+```python
+vm.write_text(
+    "/shared/maybe_private.md",
+    "hello",
+    access={
+        "default": Access.RW,
+        "floppa": Access.N,
+        "critic": Access.R,
+    },
+)
+```
+
+In this example:
+
+* `user` can read and modify the file.
+* `floppa` cannot read or modify the file.
+* `critic` can read the file but cannot modify it.
+
+The access rules are enforced by the virtual filesystem.
+
+Commands such as `cat`, `grep`, `cp`, `rm`, redirection, and `sed` use the same access rules.
+
+### Text and binary files
+
+Write normal text:
+
+```python
+vm.write_text(
+    "/shared/readme.md",
+    "# Hello\n",
+)
+```
+
+Write binary data:
+
+```python
+with open("image.png", "rb") as file:
+    image = file.read()
+
+vm.write_binary(
+    "/shared/image.png",
+    image,
+)
+```
+
+Read files from Python:
+
+```python
+text = vm.read_text("/shared/readme.md")
+image = vm.read_binary("/shared/image.png")
+```
+
+These host-side read methods bypass user access rules.
+
+This is useful when the application owns the virtual machine.
+
+### Lazy files
+
+Large files do not need to be copied into the virtual filesystem immediately.
+
+Pass an object with a `content()` method:
+
+```python
+class HugeMarkdown:
+    def content(self) -> str:
+        return build_large_markdown()
+
+
+vm.write_text(
+    "/shared/huge.md",
+    HugeMarkdown(),
+)
+```
+
+`content()` is called only when something reads the file.
+
+The same mechanism works for binary data:
+
+```python
+class HugeImage:
+    def content(self) -> bytes:
+        return build_large_image()
+
+
+vm.write_binary(
+    "/shared/huge.png",
+    HugeImage(),
+)
+```
+
+The lazy value is cached after the first read.
+
+If Bash overwrites the file, the machine removes the lazy value and stores the new file normally.
+
+### Reusable Bash tools
+
+Agents can save Bash scripts inside the virtual filesystem.
+
+```python
+vm.write_text(
+    "/tools/search.sh",
+    """
+search_all() {
+    pattern="$1"
+    root="${2:-.}"
+    grep -Rni -- "$pattern" "$root"
+}
+""",
+)
+```
+
+An agent can use the tool later:
+
+```bash
+source /tools/search.sh
+search_all "qualia" /shared
+```
+
+This makes the virtual filesystem useful as both storage and an agent toolbox.
+
+### Load and dump real files
+
+Load a real text file:
+
+```python
+vm.load_text(
+    "notes.md",
+    "/shared/notes.md",
+)
+```
+
+Load a real binary file:
+
+```python
+vm.load_binary(
+    "image.png",
+    "/shared/image.png",
+)
+```
+
+Dump a virtual file to the real filesystem:
+
+```python
+vm.dump(
+    "/shared/notes.md",
+    "output/notes.md",
+)
+```
+
+### Threads
+
+`BashMachine` is synchronous.
+
+Normal Python threads can share the same machine object:
+
+```python
+shared_vm = BashMachine()
+
+agent_a = Agent(bash=shared_vm)
+agent_b = Agent(bash=shared_vm)
+```
+
+The machine uses one `threading.RLock`.
+
+Only one shell call modifies the virtual machine at a time.
+
+Other threads block until the current shell call is complete.
+
+### Limitations
+
+`BashMachine` is not a full Linux virtual machine.
+
+It does not provide:
+
+* real operating-system users
+* POSIX UID or GID values
+* background processes
+* persistent Python processes
+* Docker containers
+* real network access
+* real Linux ACLs
+
+The access system is a small per-file policy for agent workspaces.
+
+Symbolic and hard links are disabled in user shells because path aliases can bypass path-based access rules.
+
 
 ## Development
 
