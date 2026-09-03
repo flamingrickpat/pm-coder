@@ -855,6 +855,41 @@ def make_shell_tool(settings: Settings) -> Tool[Any]:
     )
 
 
+def make_bash_machine_tool(machine: Any, user: str) -> Tool[Any]:
+    """Shell tool that routes commands into an in-memory BashMachine.
+
+    The BashMachine call is synchronous and serializes on one RLock. No
+    subprocess, no timeout, no real filesystem.
+    """
+
+    def bash_machine_shell(command: str, timeout_seconds: int = 240) -> str:
+        print(
+            f"\n[bash-machine:{user}]\n{command.rstrip()}",
+            file=sys.stderr,
+            flush=True,
+        )
+        result = machine.exec(user, command)
+        print(
+            f"[bash-machine:{user} exit {result.exit_code}]",
+            file=sys.stderr,
+            flush=True,
+        )
+        return (
+            f"exit_code: {result.exit_code}\n"
+            f"stdout:\n{result.stdout or '(empty)'}\n"
+            f"stderr:\n{result.stderr or '(empty)'}"
+        )
+
+    return Tool(
+        bash_machine_shell,
+        takes_ctx=False,
+        name="bash",
+        sequential=True,
+        max_retries=1,
+        strict=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # File tools
 #
@@ -931,6 +966,37 @@ IMAGE_MEDIA_TYPES = {
     ".jpeg": "image/jpeg",
     ".png": "image/png",
 }
+
+
+def _edit_text(
+    text: str, old_string: str, new_string: str, replace_all: bool
+) -> tuple[str | None, str]:
+    """Apply an exact string replacement in memory.
+
+    Returns (updated_text, message). updated_text is None on failure.
+    """
+    old = old_string.replace("\r\n", "\n")
+    new = new_string.replace("\r\n", "\n")
+    if not old:
+        return None, "error: old_string is empty; use write to create a file"
+    count = text.count(old)
+    if count == 0:
+        return (
+            None,
+            "error: no match for old_string. It must match the "
+            "file exactly, including whitespace and indentation."
+            + match_hint(text, old),
+        )
+    if count > 1 and not replace_all:
+        return (
+            None,
+            f"error: found {count} matches for old_string. Add "
+            "surrounding context to make it unique, or pass replace_all=true.",
+        )
+    line = text[: text.index(old)].count("\n") + 1
+    updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+    where = f"{count} occurrences" if replace_all else f"line {line}"
+    return updated, f"edited ({where}, file is now {len(split_lines(updated))} lines)"
 
 
 def make_file_tools(settings: Settings) -> list[Tool[Any]]:
@@ -1031,6 +1097,85 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         atomic_write_bytes(target, updated.replace("\n", newline).encode("utf-8"))
         where = f"{count} occurrences" if replace_all else f"line {line}"
         return f"edited {target} ({where}, file is now {len(split_lines(updated))} lines)"
+
+    return [
+        Tool(read, takes_ctx=False, name="read", sequential=True, strict=False),
+        Tool(read_image, takes_ctx=False, name="read_image", sequential=True, strict=False),
+        Tool(write, takes_ctx=False, name="write", sequential=True, strict=False),
+        Tool(edit, takes_ctx=False, name="edit", sequential=True, strict=False),
+    ]
+
+
+def make_virtual_file_tools(bash_machine: Any) -> list[Tool[Any]]:
+    """File tools that read and write in an in-memory BashMachine.
+
+    Paths are virtual, e.g. ``/home/user/notes.txt`` or relative paths.
+    Relative paths resolve against the admin shell's cwd (``/home/user``).
+    """
+
+    def read(path: str, offset: int = 1, limit: int = 0) -> str:
+        print(f"\n[read :{path}]", file=sys.stderr, flush=True)
+        try:
+            raw = bash_machine.read_text(path)
+        except Exception as exc:
+            return f"error: cannot read {path}: {exc}"
+        lines = split_lines(raw)
+        start = max(1, offset)
+        end = len(lines) if limit <= 0 else min(len(lines), start + limit - 1)
+        header = f"{path} ({len(lines)} lines)"
+        if start > 1 or end < len(lines):
+            header += f", showing lines {start}-{end}"
+        body = "\n".join(
+            f"{number}: {lines[number - 1]}" for number in range(start, end + 1)
+        )
+        return f"{header}\n{body}"
+
+    def read_image(path: str):
+        print(f"\n[read_image :{path}]", file=sys.stderr, flush=True)
+        try:
+            data = bash_machine.read_binary(path)
+        except Exception as exc:
+            return [f"error: cannot read {path}: {exc}"]
+        suffix = Path(path).suffix.lower()
+        media_type = IMAGE_MEDIA_TYPES.get(suffix)
+        if media_type is None:
+            return [
+                f"error: unsupported image type {suffix or '(none)'} in "
+                f"{path}; use .jpg, .jpeg, or .png"
+            ]
+        if not data:
+            return [f"error: file is empty: {path}"]
+        return [
+            BinaryContent(data, media_type=media_type),
+            f"image attached: {path} ({len(data):,} bytes)",
+        ]
+
+    def write(path: str, content: str) -> str:
+        body = content.replace("\r\n", "\n")
+        try:
+            bash_machine.write_text(path, body)
+        except Exception as exc:
+            return f"error: cannot write {path}: {exc}"
+        print(f"\n[write {path}]", file=sys.stderr, flush=True)
+        return f"created/overwrote {path} ({len(split_lines(body))} lines)"
+
+    def edit(
+        path: str, old_string: str, new_string: str, replace_all: bool = False
+    ) -> str:
+        print(f"\n[edit :{path}]", file=sys.stderr, flush=True)
+        try:
+            raw = bash_machine.read_text(path)
+        except Exception as exc:
+            return f"error: cannot read {path}: {exc}"
+        text = raw.replace("\r\n", "\n")
+        updated, message = _edit_text(text, old_string, new_string, replace_all)
+        if updated is None:
+            return message
+        try:
+            bash_machine.write_text(path, updated)
+        except Exception as exc:
+            return f"error: cannot write {path}: {exc}"
+        return f"edited {path} ({message})"
 
     return [
         Tool(read, takes_ctx=False, name="read", sequential=True, strict=False),
@@ -1250,8 +1395,24 @@ def discover_workspace(settings: Settings) -> DiscoveryResult:
     )
 
 
-def build_system_prompt(settings: Settings, discovery: DiscoveryResult) -> str:
+def build_system_prompt(
+    settings: Settings,
+    discovery: DiscoveryResult,
+    *,
+    shell_kind_override: str | None = None,
+    shell_executable_override: str | None = None,
+) -> str:
     shell = shell_backend(settings)
+    kind = shell_kind_override or shell.kind
+    executable = shell_executable_override or shell.executable
+    bash_machine_note = (
+        "This is an in-memory Bash environment. There is no network, "
+        "no real filesystem, and no background processes. "
+        "File paths are virtual (e.g. /home/user/notes.txt). "
+        "Use `read`, `write`, and `edit` for all file access. "
+        "Multiple agents may share this environment and work on "
+        "different files at the same time."
+    ) if shell_kind_override == "bash-machine" else ""
     mcp_summary = ", ".join(discovery.mcp_server_names) or "none configured"
     if any("minecraft" in name.casefold() for name in discovery.mcp_server_names):
         mcp_guidance = (
@@ -1281,8 +1442,8 @@ def build_system_prompt(settings: Settings, discovery: DiscoveryResult) -> str:
 
         <environment>
           <working_directory>{escape(str(settings.cwd))}</working_directory>
-          <host_shell name={quoteattr(shell.kind)}>
-            {escape(shell.executable)}
+          <host_shell name={quoteattr(kind)}>
+            {escape(executable)}
           </host_shell>
           <mcp_servers>{escape(mcp_summary)}</mcp_servers>
         </environment>
@@ -1304,10 +1465,12 @@ def build_system_prompt(settings: Settings, discovery: DiscoveryResult) -> str:
         small interleaved ones. Use `read_image` to look at a JPG or PNG
         image; the picture itself becomes part of the conversation.
 
-        `{shell.kind}` starts in the selected workspace. Use it for everything
+        `{kind}` starts in the selected workspace. Use it for everything
         else: running commands, searching, and verifying results. Project
         instructions define the exact writable paths. Do not escape the
         selected workspace.
+
+        {bash_machine_note}
 
         {mcp_guidance}
 
@@ -1579,9 +1742,32 @@ def build_agent(
     settings: Settings,
     discovery: DiscoveryResult,
     session: SessionStore,
+    *,
+    bash_machine: Any = None,
+    bash_machine_user: str = "user",
 ) -> Agent[Any, str]:
+    shell_tool = (
+        make_bash_machine_tool(bash_machine, bash_machine_user)
+        if bash_machine is not None
+        else make_shell_tool(settings)
+    )
+    file_tools = (
+        make_virtual_file_tools(bash_machine)
+        if bash_machine is not None
+        else make_file_tools(settings)
+    )
+    system_prompt = build_system_prompt(
+        settings,
+        discovery,
+        shell_kind_override="bash-machine" if bash_machine is not None else None,
+        shell_executable_override=(
+            f"in-memory BashMachine, virtual user {bash_machine_user!r}"
+            if bash_machine is not None
+            else None
+        ),
+    )
     own_tools = FunctionToolset(
-        tools=[make_shell_tool(settings), *make_file_tools(settings)]
+        tools=[shell_tool, *file_tools]
     )
     mcp_tools = (
         load_mcp_toolsets(settings.mcp_config) if settings.mcp_config is not None else []
@@ -1592,7 +1778,7 @@ def build_agent(
     )
     return Agent(
         model=make_model(settings, "agent"),
-        instructions=build_system_prompt(settings, discovery),
+        instructions=system_prompt,
         toolsets=[toolset],
         model_settings=OpenAIChatModelSettings(
             temperature=settings.temperature,
@@ -2406,6 +2592,38 @@ async def open_session(
         yield agent, discovery, store
 
 
+@asynccontextmanager
+async def open_bash_machine_session(
+    settings: Settings,
+    bash_machine: Any,
+    *,
+    run_id: str | None = None,
+    log_root: str | Path = DEFAULT_LOG_ROOT,
+    user: str = "user",
+) -> Any:
+    """Yield a live (agent, discovery, store) backed by an in-memory BashMachine.
+
+    Like :func:`open_session`, but the shell tool routes into ``bash_machine``
+    instead of spawning a real subprocess. The same BashMachine can be shared
+    across multiple sessions in different threads.
+
+    ``user`` is the virtual user name inside the BashMachine.
+    """
+    global active_session
+    discovery = discover_workspace(settings)
+    store = SessionStore.open(settings.cwd, run_id, log_root=Path(log_root).expanduser())
+    active_session = store
+    agent = build_agent(
+        settings, discovery, store,
+        bash_machine=bash_machine,
+        bash_machine_user=user,
+    )
+    print_startup(settings, discovery, store)
+    note(f"bash-machine: user={user!r}")
+    async with agent:
+        yield agent, discovery, store
+
+
 async def async_run_auto(
     prompt_or_path: str | Path,
     *,
@@ -2438,6 +2656,47 @@ def run_auto(prompt_or_path: str | Path, **kwargs: Any) -> dict[str, Any]:
     except RuntimeError:
         return asyncio.run(async_run_auto(prompt_or_path, **kwargs)).as_dict()
     raise RuntimeError("run_auto cannot run inside an event loop; use async_run_auto")
+
+
+async def async_run_auto_with_bash_machine(
+    prompt_or_path: str | Path,
+    bash_machine: Any,
+    *,
+    user: str = "user",
+    run_id: str | None = None,
+    log_root: str | Path = DEFAULT_LOG_ROOT,
+    **settings_kwargs: Any,
+) -> TurnResult:
+    """Like :func:`async_run_auto`, but the shell tool runs in ``bash_machine``.
+
+    ``bash_machine`` is a :class:`BashMachine` instance. It can be shared
+    across threads.
+    """
+    settings = build_settings(**settings_kwargs)
+    async with open_bash_machine_session(
+        settings, bash_machine, run_id=run_id, log_root=log_root, user=user,
+    ) as (agent, _discovery, store):
+        return await run_turn(
+            agent, settings, store, prompt_text(prompt_or_path, settings.cwd)
+        )
+
+
+def run_auto_with_bash_machine(
+    prompt_or_path: str | Path,
+    bash_machine: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Synchronous :func:`async_run_auto_with_bash_machine`."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            async_run_auto_with_bash_machine(prompt_or_path, bash_machine, **kwargs)
+        ).as_dict()
+    raise RuntimeError(
+        "run_auto_with_bash_machine cannot run inside an event loop; "
+        "use async_run_auto_with_bash_machine"
+    )
 
 
 def read_user_prompt() -> str | None:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pm-coder"
-version = "0.3.0"
+version = "0.3.1"
 description = "An unattended coding agent for local OpenAI-compatible models"
 readme = "README.md"
 license = "MIT"
