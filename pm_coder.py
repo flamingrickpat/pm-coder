@@ -19,6 +19,16 @@ has three failure policies and no exit condition:
 Nothing else stops the loop. There are no request limits, no wall-clock
 limits, and no output caps. Values that must exist are used directly so a
 logic error crashes loudly instead of being papered over.
+
+Two things ride along inside that loop:
+
+* loop detection -- every tool call is normalized and counted; when the
+  last LOOP_WINDOW calls repeat at most LOOP_MAX_DISTINCT operations, a
+  fake user turn tells the model to stop, and each compaction hands the
+  model a stats view of every call and its amount;
+* sub-agents -- the `subagent` tool runs 2-5 fresh pm-coder sessions to
+  completion, serially or SUBAGENT_SLOTS at a time, and returns one report:
+  how each finished, a summary of its chat, and its final answer.
 """
 
 from __future__ import annotations
@@ -36,14 +46,16 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import urllib.request
 from abc import ABC, abstractmethod
+from collections import Counter
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence, List
 from xml.sax.saxutils import escape, quoteattr
 
 from openai import AsyncOpenAI
@@ -84,7 +96,19 @@ DEFAULT_LOG_ROOT = Path("~/.pm/pm-coder").expanduser()
 DEFAULT_SHELL_TIMEOUT = 240
 SHELL_TERMINATE_GRACE_SECONDS = 2.0
 DEFAULT_TEMPERATURE = 0.7
-DEFAULT_MAX_TOKENS = 8_192
+DEFAULT_MAX_TOKENS = 0
+
+# Sub-agents: the `subagent` tool takes this many prompts, and runs this many
+# sessions at the same time. One slot runs the prompts serially.
+SUBAGENT_MIN_PROMPTS = 1
+SUBAGENT_MAX_PROMPTS = 5
+
+# Loop detection: when the last LOOP_WINDOW tool calls hold at most
+# LOOP_MAX_DISTINCT distinct calls, the agent is stuck. Two distinct calls
+# catch the ping-pong loop (read A, grep B, read A, grep B) a small model
+# falls into, which a same-call-only check would miss.
+LOOP_WINDOW = 6
+LOOP_MAX_DISTINCT = 2
 
 # Seconds to wait before retrying after any failure that is not a context
 # problem. One fixed delay: a week-long run has no deadline to race.
@@ -152,6 +176,19 @@ FRONTMATTER_RE = re.compile(r"\A---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", re.DOTA
 # Unlimited must be spelled out: UsageLimits() alone defaults to 50 requests.
 NO_LIMITS = UsageLimits(request_limit=None)
 
+READ_DEFAULT_LINE_LENGTH = 8_192
+READ_DEFAULT_COLUMN_LENGTH = 4_096
+
+# Absolute safety fuse. The model cannot override this.
+READ_HARD_OUTPUT_CHARS = 64_000
+
+# Leave room for headers, continuation instructions, etc.
+READ_BODY_BUDGET = 56_000
+
+# Physical scanning is chunked, so a 200 MB one-line minified JS file
+# never becomes one 200 MB Python string.
+READ_SCAN_CHARS = 8_192
+
 # The library surface. Everything here can be imported and used without the
 # CLI; anything not listed is an internal detail and may change.
 __all__ = [
@@ -171,9 +208,11 @@ __all__ = [
     "find_mcp_config",
     "find_skill",
     "load_skills",
+    "loop_alert_injector",
     "make_bash_machine_tool",
     "make_file_tools",
     "make_shell_tool",
+    "make_subagent_tool",
     "make_virtual_file_tools",
     "open_bash_machine_session",
     "open_session",
@@ -358,6 +397,26 @@ def keep_recent_images(messages: list[ModelMessage]) -> list[ModelMessage]:
     note(f"{total} images in history; keeping the newest {IMAGE_LOW_WATER}")
     return _omit_older_images(messages, IMAGE_LOW_WATER)
 
+
+def loop_alert_injector(session: SessionStore):
+    """Build the ProcessHistory that turns a pending alert into a user turn.
+
+    The alert is appended after the newest message. At this point every tool
+    call is answered, so the request stays valid. It is a user turn, not a
+    tool retry, because a retried request resamples the same distribution.
+    """
+
+    def inject(messages: list[Any]) -> list[Any]:
+        alert = session.pending_alert
+        if alert is None:
+            return messages
+        session.pending_alert = None
+        note("injecting user turn: " + alert.splitlines()[0])
+        return [*messages, ModelRequest(parts=[UserPromptPart(content=alert)])]
+
+    return inject
+
+
 class SessionStore:
     """One conversation on disk as Pydantic AI model messages.
 
@@ -379,6 +438,34 @@ class SessionStore:
         # the fragment produced so far.
         self.live_history: list[Any] | None = None
         self.last_snapshot = 0.0
+        # Normalized tool-call history since the last compaction: loop
+        # detection reads the tail, the compaction stats view reads it all.
+        self.tool_calls: list[str] = []
+        # Text the next model request gets as a fake user turn: a loop alert
+        # or the compaction stats view. Cleared once injected.
+        self.pending_alert: str | None = None
+
+    def record_tool_call(self, name: str, tool_args: dict[str, Any]) -> None:
+        """Count one normalized tool call, and flag a loop when it repeats."""
+        key = (name + " " + json.dumps(tool_args, sort_keys=True, default=str)).casefold()
+        self.tool_calls.append(key)
+        window = self.tool_calls[-LOOP_WINDOW:]
+        if len(window) == LOOP_WINDOW and len(set(window)) <= LOOP_MAX_DISTINCT:
+            repeated = "".join(f"- {call[:200]}\n" for call in sorted(set(window)))
+            self.pending_alert = (
+                f"[loop alert] The last {LOOP_WINDOW} tool calls repeated the "
+                f"same {len(set(window))} operations:\n{repeated}"
+                "Stop this loop. State a new hypothesis, then use a different "
+                "tool or different arguments. Do not repeat these calls."
+            )
+
+    def tool_stats_report(self) -> str:
+        """The compaction stats view: each call and the amount of times."""
+        if not self.tool_calls:
+            return "(no tool calls since the last checkpoint)"
+        counts = Counter(self.tool_calls)
+        lines = [f"{amount}x {call[:200]}" for call, amount in counts.most_common()]
+        return "tool calls since the last checkpoint (amount x call):\n" + "\n".join(lines)
 
     @property
     def run_id(self) -> str:
@@ -1052,6 +1139,339 @@ def match_hint(text: str, needle: str) -> str:
     rendered = "\n".join(f"{number}: {line}" for number, line in close)
     return f"\nClosest lines in the file:\n{rendered}"
 
+def _resolve_read_args(
+    start_line: int,
+    line_length: int,
+    start_column: int,
+    column_length: int,
+) -> tuple[int, int, int, int]:
+    return (
+        1 if start_line <= 0 else start_line,
+        READ_DEFAULT_LINE_LENGTH if line_length <= 0 else line_length,
+        1 if start_column <= 0 else start_column,
+        READ_DEFAULT_COLUMN_LENGTH if column_length <= 0 else column_length,
+    )
+
+
+def _discard_line_tail(handle) -> tuple[bool, bool]:
+    """Consume the rest of one physical line without ever loading it whole.
+
+    Returns (had_more_text, hit_eof).
+    """
+    had_text = False
+
+    while True:
+        chunk = handle.readline(READ_SCAN_CHARS)
+
+        if chunk == "":
+            return had_text, True
+
+        if chunk.endswith("\n"):
+            return had_text or len(chunk) > 1, False
+
+        had_text = True
+
+
+def _read_line_slice(
+    handle,
+    start_column: int,
+    length: int,
+) -> tuple[str, bool, bool, bool]:
+    """Read one bounded slice from the current physical line.
+
+    The handle MUST currently be at the beginning of a physical line.
+
+    Returns:
+        text
+        has_more_columns
+        hit_eof
+        line_exists
+
+    The rest of the physical line is consumed before returning, so the handle
+    is positioned at the beginning of the next line.
+    """
+    end_column = start_column + length - 1
+    column = 1
+    out: list[str] = []
+    saw_anything = False
+
+    while True:
+        chunk = handle.readline(READ_SCAN_CHARS)
+
+        if chunk == "":
+            return "".join(out), False, True, saw_anything
+
+        saw_anything = True
+
+        has_newline = chunk.endswith("\n")
+        text = chunk[:-1] if has_newline else chunk
+
+        chunk_start = column
+        chunk_end = column + len(text) - 1
+
+        left = max(start_column, chunk_start)
+        right = min(end_column, chunk_end)
+
+        if left <= right:
+            out.append(text[left - chunk_start : right - chunk_start + 1])
+
+        # We reached the requested column boundary.
+        if chunk_end >= end_column:
+            if has_newline:
+                return "".join(out), chunk_end > end_column, False, True
+
+            tail_has_text, hit_eof = _discard_line_tail(handle)
+
+            return (
+                "".join(out),
+                chunk_end > end_column or tail_has_text,
+                hit_eof,
+                True,
+            )
+
+        # Physical line ended before the requested column boundary.
+        if has_newline:
+            return "".join(out), False, False, True
+
+        column = chunk_end + 1
+
+
+def _bounded_read_stream(
+    handle,
+    label: str,
+    size: int,
+    start_line: int,
+    line_length: int,
+    start_column: int,
+    column_length: int,
+) -> str:
+    start_line, line_length, start_column, column_length = _resolve_read_args(
+        start_line,
+        line_length,
+        start_column,
+        column_length,
+    )
+
+    if size == 0:
+        if start_line != 1:
+            raise ValueError(
+                f"start_line {start_line} is past the end of an empty file"
+            )
+
+        return (
+            f"{label} (empty file)\n"
+            f"requested start_line={start_line}, line_length={line_length}, "
+            f"start_column={start_column}, column_length={column_length}"
+        )
+
+    end_column = start_column + column_length - 1
+
+    rendered: list[str] = []
+    clipped_lines: list[int] = []
+    notes: list[str] = []
+
+    used = 0
+    current_line = 1
+    processed = 0
+    hit_eof = False
+
+    hard_stop_line: int | None = None
+    hard_column_stop = False
+
+    # Skip preceding lines in bounded chunks. This remains safe even when
+    # one of those physical lines is hundreds of megabytes long.
+    while current_line < start_line:
+        chunk = handle.readline(READ_SCAN_CHARS)
+
+        if chunk == "":
+            raise ValueError(
+                f"start_line {start_line} is past the end of the file"
+            )
+
+        if chunk.endswith("\n"):
+            current_line += 1
+
+    while processed < line_length and not hit_eof:
+        prefix = f"{current_line}: "
+
+        # Keep enough reserve that headers / continuation instructions cannot
+        # push the complete tool result beyond the hard output fuse.
+        remaining = READ_BODY_BUDGET - used - len(prefix) - 128
+
+        # Prefer stopping at a clean line boundary instead of returning seven
+        # random characters from the next ordinary line.
+        if remaining < 512:
+            hard_stop_line = current_line
+            break
+
+        capture = min(column_length, remaining)
+
+        visible, has_more_columns, hit_eof, exists = _read_line_slice(
+            handle,
+            start_column,
+            capture,
+        )
+
+        if not exists:
+            if processed == 0:
+                raise ValueError(
+                    f"start_line {start_line} is past the end of the file"
+                )
+            break
+
+        # This only happens if the model explicitly requested a column window
+        # so enormous that the absolute tool-output fuse was reached.
+        hard_column_stop = capture < column_length and has_more_columns
+
+        if hard_column_stop:
+            next_column = start_column + len(visible)
+            suffix = (
+                f" … [hard output limit; line {current_line} "
+                f"continues at column {next_column}]"
+            )
+
+        elif has_more_columns:
+            suffix = (
+                f" … [line {current_line} continues at "
+                f"column {end_column + 1}]"
+            )
+            clipped_lines.append(current_line)
+
+        else:
+            suffix = ""
+
+        piece = prefix + visible + suffix
+
+        rendered.append(piece)
+        used += len(piece) + 1
+        processed += 1
+
+        if hard_column_stop:
+            notes.append(
+                f"HARD OUTPUT LIMIT reached inside line {current_line}. "
+                f"Continue with start_line={current_line}, line_length=1, "
+                f"start_column={next_column}, "
+                f"column_length={column_length}."
+            )
+            break
+
+        current_line += 1
+
+    if hard_stop_line is not None:
+        remaining_lines = max(1, line_length - processed)
+
+        notes.append(
+            f"HARD OUTPUT LIMIT reached before line {hard_stop_line}. "
+            f"Continue with start_line={hard_stop_line}, "
+            f"line_length={remaining_lines}, "
+            f"start_column={start_column}, "
+            f"column_length={column_length}."
+        )
+
+    elif not hard_column_stop and processed >= line_length and not hit_eof:
+        # One-character peek only to avoid falsely claiming there is another line.
+        if handle.read(1) != "":
+            notes.append(
+                f"More lines exist. Continue with start_line={current_line}, "
+                f"line_length={line_length}, start_column=1, "
+                f"column_length={column_length}."
+            )
+
+    if clipped_lines:
+        shown = ", ".join(str(n) for n in clipped_lines[:20])
+
+        extra = (
+            ""
+            if len(clipped_lines) <= 20
+            else f", ... (+{len(clipped_lines) - 20} more)"
+        )
+
+        notes.append(
+            f"Long lines clipped at column {end_column}: {shown}{extra}. "
+            f"To continue one, use that line with line_length=1, "
+            f"start_column={end_column + 1}, "
+            f"column_length={column_length}."
+        )
+
+    result = (
+        f"{label} ({size:,} bytes)\n"
+        f"requested start_line={start_line}, line_length={line_length}, "
+        f"start_column={start_column}, column_length={column_length}\n"
+        + "\n".join(rendered)
+    )
+
+    if notes:
+        result += "\n\n" + "\n".join(notes)
+
+    # This should be impossible unless somebody later breaks the accounting.
+    if len(result) > READ_HARD_OUTPUT_CHARS:
+        raise RuntimeError(
+            f"internal read safety invariant broken: "
+            f"{len(result)} > {READ_HARD_OUTPUT_CHARS} characters"
+        )
+
+    return result
+
+
+def _replace_line_block(
+    raw: str,
+    content: str,
+    start: int,
+    end: int,
+) -> str:
+    """Return text after a strict whole-file or inclusive line-block write."""
+
+    # WHOLE FILE.
+    #
+    # Requiring BOTH values to be <= 0 is intentional. If the model sends
+    # start=20,end=0 we must not interpret that malformed request as
+    # "sure, overwrite the entire file".
+    if start <= 0 and end <= 0:
+        newline = newline_style(raw) if raw else "\n"
+        body = content.replace("\r\n", "\n")
+        return body.replace("\n", newline)
+
+    # Mixed whole-file/ranged semantics are always a bug.
+    if start <= 0 or end <= 0:
+        raise ValueError(
+            "invalid write range: start and end must BOTH be <= 0 for a "
+            "whole-file write, or BOTH be > 0 for a block replacement"
+        )
+
+    if start > end:
+        raise ValueError(
+            f"invalid write range: start ({start}) is greater than end ({end})"
+        )
+
+    newline = newline_style(raw)
+
+    normalized = raw.replace("\r\n", "\n")
+    had_final_newline = normalized.endswith("\n")
+
+    lines = split_lines(normalized)
+
+    if start > len(lines) or end > len(lines):
+        raise ValueError(
+            f"invalid write range {start}-{end}: "
+            f"file contains {len(lines)} lines"
+        )
+
+    replacement = split_lines(content.replace("\r\n", "\n"))
+
+    # start/end are 1-indexed and INCLUSIVE.
+    updated_lines = (
+        lines[: start - 1]
+        + replacement
+        + lines[end:]
+    )
+
+    updated = "\n".join(updated_lines)
+
+    # Partial writes preserve whether the existing file ended in a newline.
+    if had_final_newline and updated_lines:
+        updated += "\n"
+
+    return updated.replace("\n", newline)
 
 IMAGE_MEDIA_TYPES = {
     ".jpg": "image/jpeg",
@@ -1092,23 +1512,72 @@ def _edit_text(
 
 
 def make_file_tools(settings: Settings) -> list[Tool[Any]]:
-    def read(path: str, offset: int = 1, limit: int = 0) -> str:
-        """Read a text file. Line numbers are prepended; they are for reference
-        only, since `edit` addresses content by exact text. `offset` is the
-        1-indexed first line and `limit` the maximum number of lines (0 = all).
+    def read(
+            path: str,
+            start_line: int,
+            line_length: int,
+            start_column: int,
+            column_length: int,
+    ) -> str:
+        """Read a SAFE, BOUNDED window of a text file.
+
+        ALL FIVE ARGUMENTS ARE REQUIRED. DO NOT OMIT NUMERIC ARGUMENTS.
+
+        start_line:
+            1-indexed first physical line to read.
+            Pass <= 0 to start at line 1.
+
+        line_length:
+            Maximum number of physical lines requested.
+            Pass <= 0 for the default of 8000 lines.
+            A positive value overrides that default.
+
+        start_column:
+            1-indexed character column to start at INSIDE EACH returned line.
+            Pass <= 0 to start at column 1.
+
+        column_length:
+            Maximum number of characters to return FROM EACH selected line.
+            Pass <= 0 for the default of 4000 characters.
+            A positive value overrides that default.
+
+        NORMAL READ:
+            read("src/foo.py", 0, 0, 0, 0)
+
+        READ 100 LINES STARTING AT LINE 500:
+            read("src/foo.py", 500, 100, 0, 0)
+
+        READ THE NEXT 4000 CHARACTERS OF A HUGE ONE-LINE FILE:
+            read("bundle.min.js", 1, 1, 4001, 4000)
+
+        Long physical lines are never loaded whole. They are scanned in chunks.
+
+        Positive line_length/column_length values may request larger windows, but
+        an absolute tool-output safety limit can stop the result earlier. ALWAYS
+        follow the continuation coordinates printed by the tool when that happens.
         """
         target = resolve_path(settings, path)
+
         print(f"\n[read {target}]", file=sys.stderr, flush=True)
+
         if not target.is_file():
-            return f"error: file does not exist: {target}"
-        lines = split_lines(read_file_text(target))
-        start = max(1, offset)
-        end = len(lines) if limit <= 0 else min(len(lines), start + limit - 1)
-        header = f"{target} ({len(lines)} lines)"
-        if start > 1 or end < len(lines):
-            header += f", showing lines {start}-{end}"
-        body = "\n".join(f"{number}: {lines[number - 1]}" for number in range(start, end + 1))
-        return f"{header}\n{body}"
+            raise FileNotFoundError(f"file does not exist: {target}")
+
+        with target.open(
+                "r",
+                encoding="utf-8",
+                errors="replace",
+                newline=None,
+        ) as handle:
+            return _bounded_read_stream(
+                handle,
+                str(target),
+                target.stat().st_size,
+                start_line,
+                line_length,
+                start_column,
+                column_length,
+            )
 
     def read_image(path: str):
         """Attach a JPG or PNG image to the conversation so the model can see
@@ -1134,22 +1603,81 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
             f"image attached: {target} ({len(data):,} bytes)",
         ]
 
-    def write(path: str, content: str) -> str:
-        """Create a new file, or completely rewrite an existing one, as UTF-8.
+    def write(
+            path: str,
+            content: str,
+            start: int,
+            end: int,
+    ) -> str:
+        """Write a whole text file OR replace an exact inclusive line block.
 
-        Use this for a new file or a wholesale rewrite. To change part of an
-        existing file use `edit` instead: rewriting a long file spends the
-        whole response budget and risks being cut off mid-call.
+        ALL FOUR ARGUMENTS ARE REQUIRED. ALWAYS PASS start AND end.
+
+        WHOLE-FILE WRITE:
+            Pass start <= 0 AND end <= 0.
+            Example:
+                write("src/foo.py", content, 0, 0)
+
+            This creates a missing file or completely replaces an existing file.
+
+        BLOCK REPLACEMENT:
+            Pass start > 0 AND end > 0.
+            start/end are 1-indexed and INCLUSIVE.
+            Example:
+                write("src/foo.py", replacement, 20, 35)
+
+            This replaces existing lines 20 THROUGH 35 with content.
+
+        IMPORTANT:
+            start <= 0 and end > 0 is INVALID.
+            start > 0 and end <= 0 is INVALID.
+            start > end is INVALID.
+            A range outside the current file is INVALID.
+            A ranged write to a nonexistent file is INVALID.
+            Invalid requests RAISE an exception instead of guessing.
+
+            content="" with a valid positive range DELETES those lines.
+
+        Re-read the relevant lines immediately before a ranged write if line
+        numbers may have changed. Use edit() instead when exact old text is known
+        and line-number drift would be dangerous.
         """
         target = resolve_path(settings, path)
-        existed = target.is_file()
-        body = content.replace("\r\n", "\n")
-        if existed:
-            body = body.replace("\n", newline_style(read_file_text(target)))
-        atomic_write_bytes(target, body.encode("utf-8"))
-        verb = "overwrote" if existed else "created"
-        print(f"\n[write {verb} {target}]", file=sys.stderr, flush=True)
-        return f"{verb} {target} ({len(split_lines(body))} lines)"
+
+        print(
+            f"\n[write {target} start={start} end={end}]",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        whole_file = start <= 0 and end <= 0
+
+        if not whole_file and not target.is_file():
+            raise FileNotFoundError(
+                f"cannot perform ranged write: file does not exist: {target}"
+            )
+
+        raw = read_file_text(target) if target.is_file() else ""
+
+        updated = _replace_line_block(
+            raw,
+            content,
+            start,
+            end,
+        )
+
+        atomic_write_bytes(target, updated.encode("utf-8"))
+
+        mode = (
+            "whole file"
+            if whole_file
+            else f"lines {start}-{end}"
+        )
+
+        return (
+            f"wrote {target} ({mode}; "
+            f"file is now {len(split_lines(updated))} lines)"
+        )
 
     def edit(
         path: str, old_string: str, new_string: str, replace_all: bool = False
@@ -1530,7 +2058,8 @@ def build_system_prompt(
         skill_block = format_skill_index(discovery.skills)
     return textwrap.dedent(
         f"""
-        You are a local coding agent operating directly in one agent workspace.
+        You are a local coding agent "pm-coder" operating directly in one agent workspace. 
+        Your context size is {settings.context_window}, temperature is {settings.temperature} and max_tokens is {settings.max_tokens}.
 
         <environment>
           <working_directory>{escape(str(settings.cwd))}</working_directory>
@@ -1827,6 +2356,7 @@ class SnapshotToolset(WrapperToolset[Any]):
             self.session.snapshot()
         except Exception as exc:
             note(f"snapshot failed: {exc!r}")
+        self.session.record_tool_call(name, tool_args)
         return result
 
 
@@ -1837,6 +2367,8 @@ def build_agent(
     *,
     bash_machine: Any = None,
     bash_machine_user: str = "user",
+    extra_instructions: str = "",
+    with_subagent_tool: bool = False,
 ) -> Agent[Any, str]:
     shell_tool = (
         make_bash_machine_tool(bash_machine, bash_machine_user)
@@ -1860,6 +2392,7 @@ def build_agent(
     )
     own_tools = FunctionToolset(
         tools=[shell_tool, *file_tools]
+        + ([make_subagent_tool(settings)] if with_subagent_tool else [])
     )
     mcp_tools = (
         load_mcp_toolsets(settings.mcp_config) if settings.mcp_config is not None else []
@@ -1870,7 +2403,7 @@ def build_agent(
     )
     return Agent(
         model=make_model(settings, "agent"),
-        instructions=system_prompt,
+        instructions=system_prompt + extra_instructions,
         toolsets=[toolset],
         model_settings=OpenAIChatModelSettings(
             temperature=settings.temperature,
@@ -1880,6 +2413,7 @@ def build_agent(
         ),
         capabilities=[
             ProcessHistory(keep_recent_images),
+            ProcessHistory(loop_alert_injector(session)),
         ],
         retries=3,
         max_concurrency=1,
@@ -2446,6 +2980,161 @@ async def compact(settings: Settings, history: list[Any], recoveries: int) -> li
 
 
 # ---------------------------------------------------------------------------
+# Sub-agents
+#
+# The `subagent` tool starts fresh pm-coder sessions and blocks until every
+# one finished. Each sub-agent gets the parent's settings and tools, the
+# normal system prompt plus an addendum, and no autocompact: one
+# agent.run, and when the context is full it stops. What comes back is, per
+# sub-agent, how it finished, a summary of its whole chat, and its final
+# answer. Slots gate how many run at the same time; one slot runs serially.
+# ---------------------------------------------------------------------------
+
+SUBAGENT_ADDENDUM = """
+<subagent>
+You are a sub-agent. Complete the task in the user prompt.
+You cannot ask questions. You cannot compact your context: when your
+context is full, you stop. Read only the files you need. Report your
+final answer before your context is full. Your final message goes back
+to the parent agent, so make it complete and specific: name files,
+results, and anything the parent must know.
+</subagent>
+"""
+
+SUBAGENT_TOOL_DOC = f"""Start {SUBAGENT_MIN_PROMPTS} to {SUBAGENT_MAX_PROMPTS} sub-agents at once.
+Each sub-agent is a fresh coding agent with the same tools and settings,
+but no memory of this conversation. Give each prompt a complete task
+description: the sub-agent cannot ask questions. Sub-agents cannot
+compact their context. This call blocks until every sub-agent finished.
+For each sub-agent you get: how it finished, a summary of its work, and
+its final answer.
+You can also add a shared prompt as prompt or filepath, that will be prepended to all prompts. Leave empty for no shared
+part.
+Sub-agents can be used to offload work so keep your own context small. For example reviewing a large PR could be done 
+with sub-agents. Every subagents gets a different batch of files and you only review their reports, so you don't blow
+your own context on reading ALL files. That's why it's very very important to give long and exhaustive system prompts.
+Tell the sub-agents EXACTLY why, what and how they should do something. A better prompt for them saves tokens in the 
+long run, because the sub-agents don't wast time doing something wrong or unrequested. A few thousand tokens in their
+prompt could save hundreds of thousands of tokens in total, while increasing performance even.
+Because of that, you might run into problems with string-length for prompt. You can also make temp files with the full
+prompt, and even include additional skills in there as normal text, and pass the filename instead of prompt. If the 
+list item is a file on the file-system, the content will be used as prompt.
+"""
+
+
+def make_subagent_tool(settings: Settings) -> Tool[Any]:
+    def subagent(
+        shared_prompt: str,
+        prompts: List[str]
+    ) -> str:
+        if len(prompts) < SUBAGENT_MIN_PROMPTS:
+            return (
+                f"error: give at least {SUBAGENT_MIN_PROMPTS} non-empty prompts, "
+                f"got {len(prompts)}"
+            )
+        note(f"subagents: starting {len(prompts)}")
+        # No scheduling: every worker takes one slot, and waits for its turn.
+        results: list[dict[str, Any]] = []
+        threads: list[threading.Thread] = []
+        for prompt in prompts:
+            record: dict[str, Any] = {"prompt": prompt}
+            results.append(record)
+            worker = threading.Thread(
+                target=_run_subagent, args=(settings, shared_prompt, prompt, record)
+            )
+            threads.append(worker)
+            worker.start()
+        for worker in threads:
+            worker.join()
+        return _render_subagent_results(results)
+
+    subagent.__doc__ = SUBAGENT_TOOL_DOC
+    return Tool(subagent, takes_ctx=False, name="subagent", sequential=True, strict=False)
+
+
+def _run_subagent(
+    settings: Settings, shared_prompt: str, prompt: str, record: dict[str, Any]
+) -> None:
+    if shared_prompt is None:
+        shared_prompt = ""
+    if prompt is None:
+        prompt = ""
+    if os.path.exists(shared_prompt):
+        with open(shared_prompt, "r", encoding="utf-8") as f:
+            shared_prompt = f.read()
+    if os.path.exists(prompt):
+        with open(prompt, "r", encoding="utf-8") as f:
+            prompt = f.read()
+
+    prompt = f"{shared_prompt}\n{prompt}".strip()
+
+    p = prompt.replace("\n", "\\n")
+    note(f"subagent start: {p}")
+    try:
+        record.update(asyncio.run(_subagent_turn(settings, prompt)))
+    except BaseException as exc:
+        record["status"] = f"crashed: {type(exc).__name__}: {exc}"
+    note(f"subagent done: {record.get('status', '?')}")
+
+
+async def _subagent_turn(settings: Settings, prompt: str) -> dict[str, Any]:
+    """One sub-agent run: no recovery loop, no compaction, one attempt."""
+    discovery = discover_workspace(settings)
+    # Its own session dir, so the chat survives for debugging. The HTTP
+    # request dumps still go to active_session, which stays the parent's.
+    session = SessionStore.open(settings.cwd)
+    agent = build_agent(
+        settings, discovery, session, extra_instructions=SUBAGENT_ADDENDUM
+    )
+    async with agent:
+        with capture_run_messages() as captured:
+            try:
+                result = await agent.run(prompt, usage_limits=NO_LIMITS)
+            except Exception as exc:
+                # Out of memory or a broken response: the sub-agent stops.
+                # The chat is still worth a summary for the parent.
+                messages = list(captured)
+                summary = await _subagent_summary(settings, session, messages)
+                return {
+                    "status": f"stopped: {type(exc).__name__}: {exc}",
+                    "summary": summary,
+                }
+    session.save_messages(result.all_messages())
+    return {
+        "status": "completed",
+        "summary": await _subagent_summary(settings, session, result.all_messages()),
+        "output": str(result.output),
+    }
+
+
+async def _subagent_summary(
+    settings: Settings, session: SessionStore, messages: list[Any]
+) -> str:
+    """Short summary of a sub-agent's thinking and tool calls."""
+    if not messages:
+        return "(the sub-agent made no calls)"
+    try:
+        return await summarize(settings, messages)
+    except Exception:
+        # The endpoint is down or the chat cannot be summarized. The raw
+        # call list is still a summary.
+        return session.tool_stats_report()
+
+
+def _render_subagent_results(results: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for number, record in enumerate(results):
+        lines = [f"=== sub-agent {number}: {record.get('status', '?')} ==="]
+        # lines.append(f"prompt: {record['prompt'][:200]}")
+        if "output" in record:
+            lines.append(f"Final answer:\n{record['output']}")
+        else:
+            lines.append(f"Summary of unfinished/failed execution:\n{record.get('summary', '(none)')}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # The loop iteration
 # ---------------------------------------------------------------------------
 
@@ -2532,6 +3221,15 @@ async def run_turn(
         history = await compact(settings, history, recoveries)
         floor = count_tokens(history)
         session.save_messages(history)
+        # The stats view rides into the next request as a fake user turn:
+        # what was done since the last checkpoint, so the model does not
+        # redo it, and a read loop is visible to the model itself.
+        session.pending_alert = (
+            (session.pending_alert + "\n\n" if session.pending_alert else "")
+            + "[checkpoint stats]\n"
+            + session.tool_stats_report()
+        )
+        session.tool_calls.clear()
         if floor >= before:
             # Already as small as this strategy can make it. Retrying
             # immediately would just summarize the same messages forever.
@@ -2678,7 +3376,7 @@ async def open_session(
     discovery = discover_workspace(settings)
     store = SessionStore.open(settings.cwd, run_id, log_root=Path(log_root).expanduser())
     active_session = store
-    agent = build_agent(settings, discovery, store)
+    agent = build_agent(settings, discovery, store, with_subagent_tool=True)
     print_startup(settings, discovery, store)
     async with agent:
         yield agent, discovery, store
@@ -2874,10 +3572,10 @@ def main() -> None:
         asyncio.run(async_main())
     except KeyboardInterrupt:
         note("interrupted")
-        raise SystemExit(130) from None
+        os._exit(1)
     except InputTooLarge as exc:
         note(str(exc))
-        raise SystemExit(1) from None
+        os._exit(1)
 
 
 if __name__ == "__main__":
