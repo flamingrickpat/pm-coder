@@ -26,8 +26,8 @@ Two things ride along inside that loop:
   last LOOP_WINDOW calls repeat at most LOOP_MAX_DISTINCT operations, a
   fake user turn tells the model to stop, and each compaction hands the
   model a stats view of every call and its amount;
-* sub-agents -- the `subagent` tool runs 2-5 fresh pm-coder sessions to
-  completion, serially or SUBAGENT_SLOTS at a time, and returns one report:
+* sub-agents -- the `subagent` tool runs 1-5 fresh pm-coder sessions to
+  completion concurrently and returns one report:
   how each finished, a summary of its chat, and its final answer.
 """
 
@@ -98,8 +98,7 @@ SHELL_TERMINATE_GRACE_SECONDS = 2.0
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 0
 
-# Sub-agents: the `subagent` tool takes this many prompts, and runs this many
-# sessions at the same time. One slot runs the prompts serially.
+# Sub-agents: the `subagent` tool accepts this inclusive prompt-count range.
 SUBAGENT_MIN_PROMPTS = 1
 SUBAGENT_MAX_PROMPTS = 5
 
@@ -178,6 +177,11 @@ NO_LIMITS = UsageLimits(request_limit=None)
 
 READ_DEFAULT_LINE_LENGTH = 8_192
 READ_DEFAULT_COLUMN_LENGTH = 4_096
+READ_DEFAULT_START_LINE = 1
+READ_DEFAULT_START_COLUMN = 1
+
+WRITE_DEFAULT_START = 0
+WRITE_DEFAULT_END = 0
 
 # Absolute safety fuse. The model cannot override this.
 READ_HARD_OUTPUT_CHARS = 64_000
@@ -1514,31 +1518,31 @@ def _edit_text(
 def make_file_tools(settings: Settings) -> list[Tool[Any]]:
     def read(
             path: str,
-            start_line: int,
-            line_length: int,
-            start_column: int,
-            column_length: int,
+            start_line: int = READ_DEFAULT_START_LINE,
+            line_length: int = READ_DEFAULT_LINE_LENGTH,
+            start_column: int = READ_DEFAULT_START_COLUMN,
+            column_length: int = READ_DEFAULT_COLUMN_LENGTH,
     ) -> str:
         """Read a SAFE, BOUNDED window of a text file.
 
-        ALL FIVE ARGUMENTS ARE REQUIRED. DO NOT OMIT NUMERIC ARGUMENTS.
+        Numeric arguments are optional. Their defaults are shown below.
 
         start_line:
             1-indexed first physical line to read.
-            Pass <= 0 to start at line 1.
+            Default: {READ_DEFAULT_START_LINE}. Pass <= 0 to start at line 1.
 
         line_length:
             Maximum number of physical lines requested.
-            Pass <= 0 for the default of 8000 lines.
+            Default: {READ_DEFAULT_LINE_LENGTH}. Pass <= 0 for this default.
             A positive value overrides that default.
 
         start_column:
             1-indexed character column to start at INSIDE EACH returned line.
-            Pass <= 0 to start at column 1.
+            Default: {READ_DEFAULT_START_COLUMN}. Pass <= 0 to start at column 1.
 
         column_length:
             Maximum number of characters to return FROM EACH selected line.
-            Pass <= 0 for the default of 4000 characters.
+            Default: {READ_DEFAULT_COLUMN_LENGTH}. Pass <= 0 for this default.
             A positive value overrides that default.
 
         NORMAL READ:
@@ -1606,17 +1610,18 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
     def write(
             path: str,
             content: str,
-            start: int,
-            end: int,
+            start: int = WRITE_DEFAULT_START,
+            end: int = WRITE_DEFAULT_END,
     ) -> str:
         """Write a whole text file OR replace an exact inclusive line block.
 
-        ALL FOUR ARGUMENTS ARE REQUIRED. ALWAYS PASS start AND end.
+        start and end are optional and both default to {WRITE_DEFAULT_START}.
 
         WHOLE-FILE WRITE:
-            Pass start <= 0 AND end <= 0.
+            This is the default: start={WRITE_DEFAULT_START}, end={WRITE_DEFAULT_END}.
+            You can also pass any start <= 0 AND end <= 0.
             Example:
-                write("src/foo.py", content, 0, 0)
+                write("src/foo.py", content)
 
             This creates a missing file or completely replaces an existing file.
 
@@ -1678,6 +1683,23 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
             f"wrote {target} ({mode}; "
             f"file is now {len(split_lines(updated))} lines)"
         )
+
+    # These must be ordinary docstrings for the tool schema. Substitute the
+    # constants after definition because an f-string would not be a docstring.
+    assert read.__doc__ is not None
+    read.__doc__ = (
+        read.__doc__
+        .replace("{READ_DEFAULT_START_LINE}", str(READ_DEFAULT_START_LINE))
+        .replace("{READ_DEFAULT_LINE_LENGTH}", str(READ_DEFAULT_LINE_LENGTH))
+        .replace("{READ_DEFAULT_START_COLUMN}", str(READ_DEFAULT_START_COLUMN))
+        .replace("{READ_DEFAULT_COLUMN_LENGTH}", str(READ_DEFAULT_COLUMN_LENGTH))
+    )
+    assert write.__doc__ is not None
+    write.__doc__ = (
+        write.__doc__
+        .replace("{WRITE_DEFAULT_START}", str(WRITE_DEFAULT_START))
+        .replace("{WRITE_DEFAULT_END}", str(WRITE_DEFAULT_END))
+    )
 
     def edit(
         path: str, old_string: str, new_string: str, replace_all: bool = False
@@ -2392,7 +2414,17 @@ def build_agent(
     )
     own_tools = FunctionToolset(
         tools=[shell_tool, *file_tools]
-        + ([make_subagent_tool(settings)] if with_subagent_tool else [])
+        + (
+            [
+                make_subagent_tool(
+                    settings,
+                    bash_machine=bash_machine,
+                    bash_machine_user=bash_machine_user,
+                )
+            ]
+            if with_subagent_tool
+            else []
+        )
     )
     mcp_tools = (
         load_mcp_toolsets(settings.mcp_config) if settings.mcp_config is not None else []
@@ -2987,7 +3019,7 @@ async def compact(settings: Settings, history: list[Any], recoveries: int) -> li
 # normal system prompt plus an addendum, and no autocompact: one
 # agent.run, and when the context is full it stops. What comes back is, per
 # sub-agent, how it finished, a summary of its whole chat, and its final
-# answer. Slots gate how many run at the same time; one slot runs serially.
+# answer. Submitted sub-agents run concurrently.
 # ---------------------------------------------------------------------------
 
 SUBAGENT_ADDENDUM = """
@@ -3001,46 +3033,63 @@ results, and anything the parent must know.
 </subagent>
 """
 
-SUBAGENT_TOOL_DOC = f"""Start {SUBAGENT_MIN_PROMPTS} to {SUBAGENT_MAX_PROMPTS} sub-agents at once.
-Each sub-agent is a fresh coding agent with the same tools and settings,
-but no memory of this conversation. Give each prompt a complete task
-description: the sub-agent cannot ask questions. Sub-agents cannot
-compact their context. This call blocks until every sub-agent finished.
-For each sub-agent you get: how it finished, a summary of its work, and
-its final answer.
-You can also add a shared prompt as prompt or filepath, that will be prepended to all prompts. Leave empty for no shared
-part.
-Sub-agents can be used to offload work so keep your own context small. For example reviewing a large PR could be done 
-with sub-agents. Every subagents gets a different batch of files and you only review their reports, so you don't blow
-your own context on reading ALL files. That's why it's very very important to give long and exhaustive system prompts.
-Tell the sub-agents EXACTLY why, what and how they should do something. A better prompt for them saves tokens in the 
-long run, because the sub-agents don't wast time doing something wrong or unrequested. A few thousand tokens in their
-prompt could save hundreds of thousands of tokens in total, while increasing performance even.
-Because of that, you might run into problems with string-length for prompt. You can also make temp files with the full
-prompt, and even include additional skills in there as normal text, and pass the filename instead of prompt. If the 
-list item is a file on the file-system, the content will be used as prompt.
-"""
-
-
-def make_subagent_tool(settings: Settings) -> Tool[Any]:
+def make_subagent_tool(
+    settings: Settings,
+    *,
+    bash_machine: Any = None,
+    bash_machine_user: str = "user",
+) -> Tool[Any]:
     def subagent(
         shared_prompt: str,
         prompts: List[str]
     ) -> str:
+        """Start {SUBAGENT_MIN_PROMPTS} to {SUBAGENT_MAX_PROMPTS} sub-agents at once.
+        Each sub-agent is a fresh coding agent with the same tools and settings,
+        but no memory of this conversation. Give each prompt a complete task
+        description: the sub-agent cannot ask questions. Sub-agents cannot
+        compact their context. This call blocks until every sub-agent finished.
+        For each sub-agent you get: how it finished, a summary of its work, and
+        its final answer.
+
+        You can add a shared prompt as text or a file path; it is prepended to
+        every prompt. Leave it empty for no shared part. Prompt list items may
+        also be text or file paths. When this agent has a BashMachine virtual
+        filesystem, file paths are resolved there, never on the host filesystem.
+
+        Use sub-agents to offload independent work and keep your own context
+        small. Give them exact goals, scope, expected checks, and relevant
+        context. A detailed prompt prevents wasted work. For a very long prompt,
+        put the text in a file and pass that path instead.
+        """
         if len(prompts) < SUBAGENT_MIN_PROMPTS:
             return (
                 f"error: give at least {SUBAGENT_MIN_PROMPTS} non-empty prompts, "
                 f"got {len(prompts)}"
             )
+        if len(prompts) > SUBAGENT_MAX_PROMPTS:
+            return (
+                f"error: give at most {SUBAGENT_MAX_PROMPTS} non-empty prompts, "
+                f"got {len(prompts)}"
+            )
+        if any(not prompt or not prompt.strip() for prompt in prompts):
+            return "error: every sub-agent prompt must be non-empty"
         note(f"subagents: starting {len(prompts)}")
-        # No scheduling: every worker takes one slot, and waits for its turn.
+        # A tool call is capped at five workers, which all run concurrently.
         results: list[dict[str, Any]] = []
         threads: list[threading.Thread] = []
         for prompt in prompts:
             record: dict[str, Any] = {"prompt": prompt}
             results.append(record)
             worker = threading.Thread(
-                target=_run_subagent, args=(settings, shared_prompt, prompt, record)
+                target=_run_subagent,
+                args=(
+                    settings,
+                    shared_prompt,
+                    prompt,
+                    record,
+                    bash_machine,
+                    bash_machine_user,
+                ),
             )
             threads.append(worker)
             worker.start()
@@ -3048,43 +3097,77 @@ def make_subagent_tool(settings: Settings) -> Tool[Any]:
             worker.join()
         return _render_subagent_results(results)
 
-    subagent.__doc__ = SUBAGENT_TOOL_DOC
+    assert subagent.__doc__ is not None
+    subagent.__doc__ = (
+        subagent.__doc__
+        .replace("{SUBAGENT_MIN_PROMPTS}", str(SUBAGENT_MIN_PROMPTS))
+        .replace("{SUBAGENT_MAX_PROMPTS}", str(SUBAGENT_MAX_PROMPTS))
+    )
     return Tool(subagent, takes_ctx=False, name="subagent", sequential=True, strict=False)
 
 
 def _run_subagent(
-    settings: Settings, shared_prompt: str, prompt: str, record: dict[str, Any]
+    settings: Settings,
+    shared_prompt: str,
+    prompt: str,
+    record: dict[str, Any],
+    bash_machine: Any = None,
+    bash_machine_user: str = "user",
 ) -> None:
     if shared_prompt is None:
         shared_prompt = ""
     if prompt is None:
         prompt = ""
-    if os.path.exists(shared_prompt):
-        with open(shared_prompt, "r", encoding="utf-8") as f:
-            shared_prompt = f.read()
-    if os.path.exists(prompt):
-        with open(prompt, "r", encoding="utf-8") as f:
-            prompt = f.read()
+    shared_prompt = _subagent_prompt_text(settings, shared_prompt, bash_machine)
+    prompt = _subagent_prompt_text(settings, prompt, bash_machine)
 
     prompt = f"{shared_prompt}\n{prompt}".strip()
 
     p = prompt.replace("\n", "\\n")
     note(f"subagent start: {p}")
     try:
-        record.update(asyncio.run(_subagent_turn(settings, prompt)))
+        record.update(
+            asyncio.run(
+                _subagent_turn(settings, prompt, bash_machine, bash_machine_user)
+            )
+        )
     except BaseException as exc:
         record["status"] = f"crashed: {type(exc).__name__}: {exc}"
     note(f"subagent done: {record.get('status', '?')}")
 
 
-async def _subagent_turn(settings: Settings, prompt: str) -> dict[str, Any]:
+def _subagent_prompt_text(
+    settings: Settings, value: str, bash_machine: Any = None
+) -> str:
+    """Literal prompt text, unless it names a file in the active filesystem."""
+    if bash_machine is not None:
+        try:
+            return bash_machine.read_text(value)
+        except Exception:
+            # A nonexistent virtual path is ordinary literal prompt text. Do
+            # not fall through to the host filesystem from a virtual session.
+            return value
+    return prompt_text(value, settings.cwd)
+
+
+async def _subagent_turn(
+    settings: Settings,
+    prompt: str,
+    bash_machine: Any = None,
+    bash_machine_user: str = "user",
+) -> dict[str, Any]:
     """One sub-agent run: no recovery loop, no compaction, one attempt."""
     discovery = discover_workspace(settings)
     # Its own session dir, so the chat survives for debugging. The HTTP
     # request dumps still go to active_session, which stays the parent's.
     session = SessionStore.open(settings.cwd)
     agent = build_agent(
-        settings, discovery, session, extra_instructions=SUBAGENT_ADDENDUM
+        settings,
+        discovery,
+        session,
+        bash_machine=bash_machine,
+        bash_machine_user=bash_machine_user,
+        extra_instructions=SUBAGENT_ADDENDUM,
     )
     async with agent:
         with capture_run_messages() as captured:
@@ -3407,6 +3490,7 @@ async def open_bash_machine_session(
         settings, discovery, store,
         bash_machine=bash_machine,
         bash_machine_user=user,
+        with_subagent_tool=True,
     )
     print_startup(settings, discovery, store)
     note(f"bash-machine: user={user!r}")
