@@ -1143,6 +1143,17 @@ def match_hint(text: str, needle: str) -> str:
     rendered = "\n".join(f"{number}: {line}" for number, line in close)
     return f"\nClosest lines in the file:\n{rendered}"
 
+
+def tool_failure(exc: Exception) -> str:
+    """Render a tool failure as a normal, machine-readable tool result.
+
+    Tool calls are model input. Bad paths and ranges are expected recovery
+    cases, not transport failures that should abort a turn and reconnect.
+    """
+    message = str(exc) or type(exc).__name__
+    return json.dumps({"success": False, "error": message})
+
+
 def _resolve_read_args(
     start_line: int,
     line_length: int,
@@ -1560,28 +1571,29 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         an absolute tool-output safety limit can stop the result earlier. ALWAYS
         follow the continuation coordinates printed by the tool when that happens.
         """
-        target = resolve_path(settings, path)
+        try:
+            target = resolve_path(settings, path)
+            print(f"\n[read {target}]", file=sys.stderr, flush=True)
+            if not target.is_file():
+                raise FileNotFoundError(f"file does not exist: {target}")
 
-        print(f"\n[read {target}]", file=sys.stderr, flush=True)
-
-        if not target.is_file():
-            raise FileNotFoundError(f"file does not exist: {target}")
-
-        with target.open(
+            with target.open(
                 "r",
                 encoding="utf-8",
                 errors="replace",
                 newline=None,
-        ) as handle:
-            return _bounded_read_stream(
-                handle,
-                str(target),
-                target.stat().st_size,
-                start_line,
-                line_length,
-                start_column,
-                column_length,
-            )
+            ) as handle:
+                return _bounded_read_stream(
+                    handle,
+                    str(target),
+                    target.stat().st_size,
+                    start_line,
+                    line_length,
+                    start_column,
+                    column_length,
+                )
+        except Exception as exc:
+            return tool_failure(exc)
 
     def read_image(path: str):
         """Attach a JPG or PNG image to the conversation so the model can see
@@ -1639,7 +1651,7 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
             start > end is INVALID.
             A range outside the current file is INVALID.
             A ranged write to a nonexistent file is INVALID.
-            Invalid requests RAISE an exception instead of guessing.
+            Invalid requests return a failure result instead of guessing.
 
             content="" with a valid positive range DELETES those lines.
 
@@ -1647,31 +1659,32 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         numbers may have changed. Use edit() instead when exact old text is known
         and line-number drift would be dangerous.
         """
-        target = resolve_path(settings, path)
+        try:
+            target = resolve_path(settings, path)
+            print(
+                f"\n[write {target} start={start} end={end}]",
+                file=sys.stderr,
+                flush=True,
+            )
+            whole_file = start <= 0 and end <= 0
 
-        print(
-            f"\n[write {target} start={start} end={end}]",
-            file=sys.stderr,
-            flush=True,
-        )
+            if not whole_file and not target.is_file():
+                raise FileNotFoundError(
+                    f"cannot perform ranged write: file does not exist: {target}"
+                )
 
-        whole_file = start <= 0 and end <= 0
+            raw = read_file_text(target) if target.is_file() else ""
 
-        if not whole_file and not target.is_file():
-            raise FileNotFoundError(
-                f"cannot perform ranged write: file does not exist: {target}"
+            updated = _replace_line_block(
+                raw,
+                content,
+                start,
+                end,
             )
 
-        raw = read_file_text(target) if target.is_file() else ""
-
-        updated = _replace_line_block(
-            raw,
-            content,
-            start,
-            end,
-        )
-
-        atomic_write_bytes(target, updated.encode("utf-8"))
+            atomic_write_bytes(target, updated.encode("utf-8"))
+        except Exception as exc:
+            return tool_failure(exc)
 
         mode = (
             "whole file"
@@ -3232,18 +3245,36 @@ def make_subagent_tool(
         context. A detailed prompt prevents wasted work. For a very long prompt,
         put the text in a file and pass that path instead.
         """
+        try:
+            return run_subagents(shared_prompt, prompts)
+        except Exception as exc:
+            return tool_failure(exc)
+
+    def run_subagents(shared_prompt: str, prompts: List[str]) -> str:
         if len(prompts) < SUBAGENT_MIN_PROMPTS:
-            return (
-                f"error: give at least {SUBAGENT_MIN_PROMPTS} non-empty prompts, "
-                f"got {len(prompts)}"
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"give at least {SUBAGENT_MIN_PROMPTS} non-empty prompts, "
+                        f"got {len(prompts)}"
+                    ),
+                }
             )
         if len(prompts) > SUBAGENT_MAX_PROMPTS:
-            return (
-                f"error: give at most {SUBAGENT_MAX_PROMPTS} non-empty prompts, "
-                f"got {len(prompts)}"
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"give at most {SUBAGENT_MAX_PROMPTS} non-empty prompts, "
+                        f"got {len(prompts)}"
+                    ),
+                }
             )
         if any(not prompt or not prompt.strip() for prompt in prompts):
-            return "error: every sub-agent prompt must be non-empty"
+            return json.dumps(
+                {"success": False, "error": "every sub-agent prompt must be non-empty"}
+            )
         note(f"subagents: starting {len(prompts)}")
         # A tool call is capped at five workers, which all run concurrently.
         results: list[dict[str, Any]] = []
