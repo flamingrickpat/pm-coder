@@ -183,6 +183,12 @@ Sessions live in `~/.pm/pm-coder/<run_id>/`:
 - `<timestamp>_<n>.compact.json` / `.pretty.json` -- the exact body of every
   `/chat/completions` request, captured below Pydantic AI's message and tool
   conversion. One pair per request, so a long session produces a lot of them.
+- `active-stream.jsonl` -- the main agent's current streamed response events.
+  It is reset for each main-agent request.
+- `precompact_*.stream.jsonl` -- an immutable copy of `active-stream.jsonl`
+  made only when auto-compaction runs. The checkpoint names this file so a
+  resumed agent can inspect incomplete tool-argument deltas with line ranges.
+  Sub-agents do not create stream spools.
 
 With the same model, tokenizer, system instructions, tools, and chat-template
 settings, a resumed session sends the same logical prompt tokens. The llama.cpp

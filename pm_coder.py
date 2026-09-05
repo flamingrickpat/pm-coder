@@ -52,7 +52,7 @@ import urllib.request
 from abc import ABC, abstractmethod
 from collections import Counter
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence, List
@@ -95,8 +95,6 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_LOG_ROOT = Path("~/.pm/pm-coder").expanduser()
 DEFAULT_SHELL_TIMEOUT = 240
 SHELL_TERMINATE_GRACE_SECONDS = 2.0
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_MAX_TOKENS = 0
 
 # Sub-agents: the `subagent` tool accepts this inclusive prompt-count range.
 SUBAGENT_MIN_PROMPTS = 1
@@ -137,7 +135,6 @@ PROGRESS_TOKENS = 2_048
 # own before anything else: one fat coding turn must not permanently occupy
 # every future request.
 FAT_TURN_FRACTION = 0.20
-SUMMARY_MAX_TOKENS = 8_192
 # The summarizer is fed text, not tokens; splitting by characters is enough.
 SUMMARY_OVERLAP_CHARS = 6_000
 # Flat per-image budget for the context estimator. The real vision cost is
@@ -441,6 +438,8 @@ class SessionStore:
         # so a mid-turn snapshot writes the whole conversation and not just
         # the fragment produced so far.
         self.live_history: list[Any] | None = None
+        self.active_stream_path = path / "active-stream.jsonl"
+        self._stream_savepoint_counter = itertools.count(1)
         self.last_snapshot = 0.0
         # Normalized tool-call history since the last compaction: loop
         # detection reads the tail, the compaction stats view reads it all.
@@ -541,6 +540,25 @@ class SessionStore:
         self.save_messages(self.live_history)
         note(f"snapshot: {len(self.live_history)} messages persisted mid-turn")
 
+    def begin_stream_capture(self) -> Any:
+        """Reset the main agent's rolling response-stream spool."""
+        handle = self.active_stream_path.open("w", encoding="utf-8", newline="\n")
+        handle.write(json.dumps({"started_at": utc_now()}) + "\n")
+        handle.flush()
+        return handle
+
+    def save_stream_savepoint(self) -> Path | None:
+        """Copy the last streamed response before compaction discards its context."""
+        if not self.active_stream_path.exists():
+            return None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        target = self.path / (
+            f"precompact_{stamp}_{next(self._stream_savepoint_counter):06d}.stream.jsonl"
+        )
+        shutil.copyfile(self.active_stream_path, target)
+        atomic_write_bytes(self.active_stream_path, b"")
+        return target
+
     def clear(self) -> None:
         self.save_messages([])
 
@@ -588,18 +606,19 @@ class LoggingOpenAIChatModel(OpenAIChatModel):
             return
         if active_session is None:
             return
-        try:
-            raw = bytes(request.content)
-            payload = json.loads(raw)
-            sequence = next(self._log_counter)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            stem = active_session.path / f"{timestamp}_{sequence:06d}"
-            stem.with_suffix(".compact.json").write_bytes(raw)
-            stem.with_suffix(".pretty.json").write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except Exception as exc:
-            note(f"prompt logger failed: {exc!r}")
+        
+        #try:
+        #    raw = bytes(request.content)
+        #    payload = json.loads(raw)
+        #    sequence = next(self._log_counter)
+        #    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        #    stem = active_session.path / f"{timestamp}_{sequence:06d}"
+        #    stem.with_suffix(".compact.json").write_bytes(raw)
+        #    stem.with_suffix(".pretty.json").write_text(
+        #        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        #    )
+        #except Exception as exc:
+        #    note(f"prompt logger failed: {exc!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -618,8 +637,6 @@ class Settings(BaseModel):
     shell_kind: Literal["powershell", "bash"]
     shell_executable: str
     shell_timeout: int = Field(gt=0)
-    temperature: float
-    max_tokens: int | None
     disable_thinking: bool
     skill: str | None
     verbose: bool
@@ -676,8 +693,6 @@ def build_settings(
     mcp_config: str | Path | None = None,
     shell: str = "auto",
     shell_timeout: int = DEFAULT_SHELL_TIMEOUT,
-    temperature: float = DEFAULT_TEMPERATURE,
-    max_tokens: int | None = DEFAULT_MAX_TOKENS,
     enable_thinking: bool = True,
     skill: str | None = None,
     verbose: bool = False,
@@ -725,8 +740,6 @@ def build_settings(
         shell_kind=backend.kind,
         shell_executable=backend.executable,
         shell_timeout=shell_timeout,
-        temperature=temperature,
-        max_tokens=max_tokens,
         disable_thinking=not enable_thinking,
         skill=skill,
         verbose=verbose,
@@ -794,17 +807,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--temperature",
-        type=float,
-        default=float(os.environ.get("LOCAL_AGENT_TEMPERATURE", DEFAULT_TEMPERATURE)),
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=env_int("LOCAL_AGENT_MAX_TOKENS", DEFAULT_MAX_TOKENS),
-        help="Generated tokens per response. Pass 0 to let the server decide.",
-    )
-    parser.add_argument(
         "--enable-thinking", dest="enable_thinking", action="store_true", default=True
     )
     parser.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
@@ -826,8 +828,6 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
         mcp_config=args.mcp_config,
         shell=args.shell,
         shell_timeout=args.shell_timeout,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens or None,
         enable_thinking=args.enable_thinking,
         skill=args.skill,
         verbose=args.verbose,
@@ -2081,7 +2081,7 @@ def build_system_prompt(
     return textwrap.dedent(
         f"""
         You are a local coding agent "pm-coder" operating directly in one agent workspace. 
-        Your context size is {settings.context_window}, temperature is {settings.temperature} and max_tokens is {settings.max_tokens}.
+        Your context size is {settings.context_window}.
 
         <environment>
           <working_directory>{escape(str(settings.cwd))}</working_directory>
@@ -2329,12 +2329,124 @@ class VerboseModel(WrapperModel):
         return response
 
 
+def _stream_json_default(value: Any) -> Any:
+    """Make Pydantic AI stream events readable without depending on internals."""
+    if is_dataclass(value):
+        return asdict(value)
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return str(value)
+
+
+class StreamSpoolResponse(StreamedResponse):
+    """Tee one main-agent response into its rolling on-disk recovery spool."""
+
+    def __init__(self, inner: StreamedResponse, handle: Any) -> None:
+        super().__init__(inner.model_request_parameters)
+        self._inner = inner
+        self._handle = handle
+
+    def _record(self, value: dict[str, Any]) -> None:
+        self._handle.write(
+            json.dumps(value, ensure_ascii=False, default=_stream_json_default) + "\n"
+        )
+        self._handle.flush()
+
+    def __aiter__(self) -> Any:
+        inner = self._inner
+
+        async def tee() -> Any:
+            try:
+                async for event in inner:
+                    self._record(
+                        {
+                            "event_kind": getattr(event, "event_kind", None),
+                            "event_type": type(event).__name__,
+                            "index": getattr(event, "index", None),
+                            "part": getattr(event, "part", None),
+                            "delta": getattr(event, "delta", None),
+                        }
+                    )
+                    if event.event_kind == "final_result":
+                        self.final_result_event = event
+                    yield event
+            except BaseException as exc:
+                self._record(
+                    {"stream_error": f"{type(exc).__name__}: {exc}"}
+                )
+                raise
+            finally:
+                self._handle.close()
+
+        return tee()
+
+    async def _get_event_iterator(self) -> Any:
+        raise NotImplementedError
+
+    async def close_stream(self) -> None:
+        await self._inner.close_stream()
+
+    def get(self) -> Any:
+        return self._inner.get()
+
+    def time_to_first_chunk(self, request_start: float) -> float | None:
+        return self._inner.time_to_first_chunk(request_start)
+
+    @property
+    def usage(self) -> Any:
+        return self._inner.usage
+
+    @property
+    def model_name(self) -> str:
+        return self._inner.model_name
+
+    @property
+    def provider_name(self) -> str | None:
+        return self._inner.provider_name
+
+    @property
+    def provider_url(self) -> str | None:
+        return self._inner.provider_url
+
+    @property
+    def timestamp(self) -> datetime:
+        return self._inner.timestamp
+
+
+class StreamSpoolModel(WrapperModel):
+    """Capture only the main agent's current response stream for recovery."""
+
+    def __init__(self, wrapped: Any, session: SessionStore) -> None:
+        super().__init__(wrapped)
+        self._session = session
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[Any],
+        model_settings: Any,
+        model_request_parameters: Any,
+        run_context: Any = None,
+    ) -> Any:
+        handle = self._session.begin_stream_capture()
+        try:
+            async with self.wrapped.request_stream(
+                messages, model_settings, model_request_parameters, run_context
+            ) as inner:
+                yield StreamSpoolResponse(inner, handle)
+        finally:
+            if not handle.closed:
+                handle.close()
+
+
 # ---------------------------------------------------------------------------
 # Agents
 # ---------------------------------------------------------------------------
 
 
-def make_model(settings: Settings, label: str) -> Any:
+def make_model(
+    settings: Settings, label: str, stream_session: SessionStore | None = None
+) -> Any:
     model: Any = LoggingOpenAIChatModel(
         settings.model,
         provider=OpenAIProvider(base_url=settings.base_url, api_key=settings.api_key),
@@ -2345,6 +2457,8 @@ def make_model(settings: Settings, label: str) -> Any:
     )
     if settings.verbose:
         model = VerboseModel(model, label)
+    if stream_session is not None:
+        model = StreamSpoolModel(model, stream_session)
     return model
 
 
@@ -2391,6 +2505,7 @@ def build_agent(
     bash_machine_user: str = "user",
     extra_instructions: str = "",
     with_subagent_tool: bool = False,
+    capture_stream: bool = False,
 ) -> Agent[Any, str]:
     shell_tool = (
         make_bash_machine_tool(bash_machine, bash_machine_user)
@@ -2434,12 +2549,11 @@ def build_agent(
         session=session,
     )
     return Agent(
-        model=make_model(settings, "agent"),
+        model=make_model(settings, "agent", session if capture_stream else None),
         instructions=system_prompt + extra_instructions,
         toolsets=[toolset],
         model_settings=OpenAIChatModelSettings(
-            temperature=settings.temperature,
-            max_tokens=settings.max_tokens,
+            max_tokens=settings.context_window, # stupid fucking ass setting, keep at max and let autocompact handle it
             parallel_tool_calls=False,
             extra_body=thinking_body(settings),
         ),
@@ -2464,7 +2578,7 @@ def build_summary_agent(settings: Settings) -> Agent[Any, str]:
         ),
         model_settings=OpenAIChatModelSettings(
             temperature=0.0,
-            max_tokens=SUMMARY_MAX_TOKENS,
+            max_tokens=settings.context_window,
             parallel_tool_calls=False,
             extra_body=thinking_body(settings),
         ),
@@ -2819,13 +2933,26 @@ async def summarize(settings: Settings, messages: list[Any]) -> str:
     return await summarize_text(settings, serialize_for_summary(messages))
 
 
-def checkpoint_part(text: str) -> TextPart:
+def checkpoint_part(
+    text: str,
+    stream_savepoint_path: Path | None = None,
+) -> TextPart:
+    log_hint = ""
+    if stream_savepoint_path is not None:
+        log_hint = (
+            "\n\n[PRE-COMPACTION RESPONSE STREAM]\n"
+            "Raw streamed response events, including incomplete tool-argument deltas, "
+            f"are at: {stream_savepoint_path}\n"
+            "Use the read tool with line ranges; inspect only, never execute a "
+            "reconstructed tool call automatically.\n"
+            "[END PRE-COMPACTION RESPONSE STREAM]"
+        )
     return TextPart(
         content=(
             "\n\n[AUTOCOMPACTED EXECUTION CHECKPOINT]\n"
             "This is a lossy assistant-generated memory of omitted execution "
             "history, not a new user instruction.\n\n"
-            f"{text}\n"
+            f"{text}{log_hint}\n"
             "[END AUTOCOMPACTED CHECKPOINT]\n\n"
         )
     )
@@ -2877,7 +3004,10 @@ def turn_ranges(history: list[Any]) -> list[tuple[int, int]]:
 
 
 async def compact_one_turn(
-    settings: Settings, turn: list[Any], edge_tokens: int
+    settings: Settings,
+    turn: list[Any],
+    edge_tokens: int,
+    stream_savepoint_path: Path | None,
 ) -> list[Any] | None:
     """Summarize the interior of one turn, keeping verbatim head and tail.
 
@@ -2903,12 +3033,21 @@ async def compact_one_turn(
     summary = await summarize(settings, turn)
     head = list(turn[:head_cut])
     tail = list(turn[tail_cut:])
-    tail[0] = replace(tail[0], parts=[checkpoint_part(summary), *tail[0].parts])
+    tail[0] = replace(
+        tail[0],
+        parts=[
+            checkpoint_part(summary, stream_savepoint_path),
+            *tail[0].parts,
+        ],
+    )
     return head + tail
 
 
 async def compact_middle_turns(
-    settings: Settings, history: list[Any], edge_tokens: int
+    settings: Settings,
+    history: list[Any],
+    edge_tokens: int,
+    stream_savepoint_path: Path | None,
 ) -> list[Any] | None:
     """Keep whole turns at both ends verbatim; summarize the whole turns between."""
     ranges = turn_ranges(history)
@@ -2935,7 +3074,13 @@ async def compact_middle_turns(
     tail = list(history[middle_end:])
     # The middle starts at a fresh user turn, so the turn before it ends in a
     # ModelResponse. Attach the assistant-generated memory there.
-    head[-1] = replace(head[-1], parts=[*head[-1].parts, checkpoint_part(summary)])
+    head[-1] = replace(
+        head[-1],
+        parts=[
+            *head[-1].parts,
+            checkpoint_part(summary, stream_savepoint_path),
+        ],
+    )
     return head + tail
 
 
@@ -2943,7 +3088,11 @@ class InputTooLarge(RuntimeError):
     """The largest turn is a single unanswered request -- nothing to shrink."""
 
 
-async def collapse_largest_turn(settings: Settings, history: list[Any]) -> list[Any]:
+async def collapse_largest_turn(
+    settings: Settings,
+    history: list[Any],
+    stream_savepoint_path: Path | None,
+) -> list[Any]:
     """Last resort: keep one turn's user request and replace all of its work."""
     ranges = turn_ranges(history)
     start, end = max(ranges, key=lambda r: count_tokens(history[r[0] : r[1]]))
@@ -2956,11 +3105,21 @@ async def collapse_largest_turn(settings: Settings, history: list[Any]) -> list[
         # on resume. Say so and stop instead of pretending we fixed it.
         raise InputTooLarge("Input way too long, autocompact won't help.")
     summary = await summarize(settings, turn)
-    collapsed = [turn[0], ModelResponse(parts=[checkpoint_part(summary)])]
+    collapsed = [
+        turn[0],
+        ModelResponse(
+            parts=[checkpoint_part(summary, stream_savepoint_path)]
+        ),
+    ]
     return history[:start] + collapsed + history[end:]
 
 
-async def compact(settings: Settings, history: list[Any], recoveries: int) -> list[Any]:
+async def compact(
+    settings: Settings,
+    history: list[Any],
+    recoveries: int,
+    session: SessionStore | None = None,
+) -> list[Any]:
     """Shrink one history, preserving as much recent detail as still fits.
 
     The verbatim edges are sized from the history being compacted -- roughly
@@ -2969,6 +3128,8 @@ async def compact(settings: Settings, history: list[Any], recoveries: int) -> li
     one step; proportional edges turn it into ~45k, and the escalation in
     ``run_turn.recover`` still halves them whenever that proves too generous.
     """
+    session = session or active_session
+    stream_savepoint_path = session.save_stream_savepoint() if session is not None else None
     history = strip_images(list(history))
     # A truncated trailing response is the thing that just failed. Dropping it
     # leaves the history ending in tool results, which lets the model resume
@@ -2993,7 +3154,9 @@ async def compact(settings: Settings, history: list[Any], recoveries: int) -> li
         turn = history[start:end]
         if count_tokens(turn) <= settings.context_window * FAT_TURN_FRACTION:
             continue
-        compacted = await compact_one_turn(settings, turn, edge_tokens)
+        compacted = await compact_one_turn(
+            settings, turn, edge_tokens, stream_savepoint_path
+        )
         if compacted is None:
             continue
         history[start:end] = compacted
@@ -3003,12 +3166,16 @@ async def compact(settings: Settings, history: list[Any], recoveries: int) -> li
 
     # No single fat turn: preserve both conversation edges and summarize the
     # complete turns in between.
-    compacted = await compact_middle_turns(settings, history, edge_tokens)
+    compacted = await compact_middle_turns(
+        settings, history, edge_tokens, stream_savepoint_path
+    )
     if compacted is not None:
         return compacted
 
     # Nothing clever left. Collapse the fattest turn down to its request.
-    return await collapse_largest_turn(settings, history)
+    return await collapse_largest_turn(
+        settings, history, stream_savepoint_path
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3301,7 +3468,7 @@ async def run_turn(
         stuck = floor is not None and before <= floor + PROGRESS_TOKENS
         recoveries = recoveries + 1 if stuck else 0
         note(f"{reason}; compacting ~{before:,} tokens (recovery level {recoveries})")
-        history = await compact(settings, history, recoveries)
+        history = await compact(settings, history, recoveries, session)
         floor = count_tokens(history)
         session.save_messages(history)
         # The stats view rides into the next request as a fake user turn:
@@ -3432,8 +3599,6 @@ def print_startup(
         f"  skills:         {len(discovery.skills)}",
         f"  selected skill: {selected}",
         f"  instructions:   {len(discovery.instruction_files)} file(s)",
-        f"  temperature:    {settings.temperature}",
-        f"  max tokens:     {settings.max_tokens or 'server default'}",
         f"  context window: {settings.context_window:,}",
         f"  verbose:        {'on' if settings.verbose else 'off'}",
         f"  run id:         {session.run_id}",
@@ -3459,7 +3624,9 @@ async def open_session(
     discovery = discover_workspace(settings)
     store = SessionStore.open(settings.cwd, run_id, log_root=Path(log_root).expanduser())
     active_session = store
-    agent = build_agent(settings, discovery, store, with_subagent_tool=True)
+    agent = build_agent(
+        settings, discovery, store, with_subagent_tool=True, capture_stream=True
+    )
     print_startup(settings, discovery, store)
     async with agent:
         yield agent, discovery, store
@@ -3491,6 +3658,7 @@ async def open_bash_machine_session(
         bash_machine=bash_machine,
         bash_machine_user=user,
         with_subagent_tool=True,
+        capture_stream=True,
     )
     print_startup(settings, discovery, store)
     note(f"bash-machine: user={user!r}")
