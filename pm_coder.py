@@ -606,7 +606,7 @@ class LoggingOpenAIChatModel(OpenAIChatModel):
             return
         if active_session is None:
             return
-        
+
         #try:
         #    raw = bytes(request.content)
         #    payload = json.loads(raw)
@@ -2711,6 +2711,7 @@ CONTEXT_RECOVERY_PROMPT = (
 )
 
 CONTEXT_MARKERS = (
+    "token limit",
     "context limit",
     "context window",
     "context length",
@@ -2724,6 +2725,9 @@ CONTEXT_MARKERS = (
     "prompt is too long",
     "too many tokens",
     "reduce prompt",
+    "exceeded",
+    "max_tokens",
+    "max-tokens",
     "n_ctx",
 )
 
