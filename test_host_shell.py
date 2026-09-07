@@ -114,3 +114,61 @@ def test_powershell_start_process_cannot_hold_tool_open(tmp_path: Path) -> None:
                 os.kill(child_pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+
+
+def test_large_shell_output_has_bounded_tail_and_complete_logs(tmp_path):
+    from pm_coder import context_limits
+
+    logs = tmp_path / "logs"
+    result = _run_host_shell(
+        PythonBackend(sys.executable), tmp_path,
+        "import sys\nfor i in range(1000): print(f'row-{i:04d}')\n"
+        "print('E' * 20000, file=sys.stderr)\nsys.exit(7)\n",
+        timeout_seconds=5, log_dir=logs,
+    )
+    assert result.startswith("exit_code: 7\n")
+    assert "output truncated" in result
+    assert "row-0000" not in result
+    assert "row-0900" in result and "row-0999" in result
+    assert len(result) < 2 * context_limits().shell_chars + 1500
+    stdout_log = next(logs.glob("*/stdout.log"))
+    stderr_log = next(logs.glob("*/stderr.log"))
+    assert stdout_log.read_text().splitlines() == [f"row-{i:04d}" for i in range(1000)]
+    assert stderr_log.read_text().strip() == "E" * 20000
+    assert str(stdout_log) in result and str(stderr_log) in result
+
+
+def test_timeout_retains_partial_output_in_logs(tmp_path):
+    logs = tmp_path / "logs"
+    result = _run_host_shell(
+        PythonBackend(sys.executable), tmp_path,
+        "import sys, time\nprint('before timeout', flush=True)\n"
+        "print('diagnostic', file=sys.stderr, flush=True)\ntime.sleep(30)\n",
+        timeout_seconds=1, log_dir=logs,
+    )
+    assert result.startswith("timed_out: true")
+    assert "before timeout" in result and "diagnostic" in result
+    assert next(logs.glob("*/stdout.log")).read_text().strip() == "before timeout"
+    assert next(logs.glob("*/stderr.log")).read_text().strip() == "diagnostic"
+
+
+def test_shell_calls_keep_separate_logs(tmp_path):
+    logs = tmp_path / "logs"
+    for word in ("first", "second"):
+        result = _run_host_shell(
+            PythonBackend(sys.executable), tmp_path, f"print('{word}')",
+            timeout_seconds=5, log_dir=logs,
+        )
+        assert f"stdout:\n{word}" in result
+        assert "output truncated" not in result
+    assert sorted(p.read_text().strip() for p in logs.glob("*/stdout.log")) == ["first", "second"]
+
+
+def setup_module():
+    import tempfile
+    from pathlib import Path
+    import pm_coder
+
+    root = Path(tempfile.mkdtemp(prefix="pm-coder-check-"))
+    pm_coder.active_session = pm_coder.SessionStore.open(root, log_root=root / "sessions")
+    pm_coder.active_session.context_window = 96_000

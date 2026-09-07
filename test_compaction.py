@@ -2,7 +2,7 @@ from pydantic_ai.messages import ToolCallPart
 
 from pm_coder import (
     ModelRequest, ModelResponse, UserPromptPart, ToolReturnPart,
-    TextPart, compaction_tail, serialize_for_summary, COMPACT_TAIL_CHARS,
+    TextPart, compaction_tail, serialize_for_summary, context_limits,
 )
 
 
@@ -21,7 +21,7 @@ def test_oversized_result_is_omitted_without_orphaning_its_call():
     assert len(tail) == 2
     assert tail[0].parts[0].tool_call_id == "recent"
     assert tail[1].parts[0].tool_call_id == "recent"
-    assert len(serialize_for_summary(tail)) <= COMPACT_TAIL_CHARS
+    assert len(serialize_for_summary(tail)) <= context_limits().compact_tail_chars
 
 
 def test_checkpoint_is_not_carried_into_the_next_tail():
@@ -100,7 +100,6 @@ def test_selected_external_skill_survives_compaction_and_new_agent(tmp_path, mon
         return "Task remains; all exploratory reads complete."
 
     monkeypatch.setattr(pm_coder, "summarize", summary)
-    monkeypatch.setattr(pm_coder, "active_session", None)
 
     async def run():
         instructions = pm_coder.build_system_prompt(settings, pm_coder.discover_workspace(settings))
@@ -117,3 +116,13 @@ def test_selected_external_skill_survives_compaction_and_new_agent(tmp_path, mon
     asyncio.run(run())
     assert len(observed) == 3
     assert all(body in instructions for instructions in observed)
+
+
+def setup_module():
+    import tempfile
+    from pathlib import Path
+    import pm_coder
+
+    root = Path(tempfile.mkdtemp(prefix="pm-coder-check-"))
+    pm_coder.active_session = pm_coder.SessionStore.open(root, log_root=root / "sessions")
+    pm_coder.active_session.context_window = 96_000

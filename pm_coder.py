@@ -112,16 +112,52 @@ LOOP_MAX_DISTINCT = 2
 # problem. One fixed delay: a week-long run has no deadline to race.
 RETRY_DELAY_SECONDS = 30.0
 
-# 0 means "ask the endpoint": use its advertised n_ctx minus this margin so
-# generation stays under the serving cap. Used only to size compaction.
+# 0 means use the actual serving context advertised by the selected model.
 DEFAULT_CONTEXT_WINDOW = 0
-CONTEXT_SAFETY_MARGIN = 2_048
-FALLBACK_CONTEXT_WINDOW = 65_536
 
-# Character limits bound retained text; they do not predict server capacity.
-COMPACT_TAIL_CHARS = 48_000
-COMPACT_SUMMARY_CHARS = 16_000
-SUMMARY_OVERLAP_CHARS = 6_000
+@dataclass(frozen=True)
+class ContextLimits:
+    """Conservative text budgets, in characters unless explicitly named lines.
+
+    These are tuning defaults, not tokenizer estimates or model benchmarks.
+    Write size is guidance; exceeding it never discards a generated edit.
+    """
+
+    read_lines: int
+    read_columns: int
+    read_output_chars: int
+    shell_lines: int
+    shell_chars: int
+    write_chunk_chars: int
+    compact_tail_chars: int
+    compact_summary_chars: int
+    summary_overlap_chars: int
+
+    @property
+    def read_body_chars(self) -> int:
+        return self.read_output_chars - 2_000
+
+
+# Decimal minimum context sizes: 96_000 and 98_304 both select the 96k row.
+# Large contexts grow sublinearly to avoid encouraging whole-repository reads.
+#                         read lines/cols/cap, shell lines/cap, write, tail, summary, overlap
+CONTEXT_LIMITS = {
+    32_000: ContextLimits(128, 256, 12_000, 40, 3_000, 6_000, 16_000, 6_000, 2_000),
+    64_000: ContextLimits(192, 512, 20_000, 60, 5_000, 10_000, 32_000, 10_000, 4_000),
+    96_000: ContextLimits(256, 512, 28_000, 100, 8_000, 14_000, 48_000, 16_000, 6_000),
+    128_000: ContextLimits(384, 768, 36_000, 120, 10_000, 18_000, 64_000, 20_000, 6_000),
+    180_000: ContextLimits(512, 1024, 48_000, 160, 12_000, 24_000, 80_000, 24_000, 8_000),
+    230_000: ContextLimits(640, 1024, 56_000, 200, 16_000, 28_000, 96_000, 28_000, 8_000),
+    512_000: ContextLimits(768, 1536, 80_000, 250, 24_000, 40_000, 128_000, 32_000, 10_000),
+    1_000_000: ContextLimits(1024, 2048, 112_000, 300, 32_000, 56_000, 192_000, 48_000, 12_000),
+}
+
+
+def context_limits() -> ContextLimits:
+    size = active_session.context_window
+    tier = max(minimum for minimum in CONTEXT_LIMITS if size >= minimum)
+    return CONTEXT_LIMITS[tier]
+
 
 # One agent.run can last all night, so the history is snapshotted mid-turn
 # after a tool call, at most this often.
@@ -149,24 +185,6 @@ FRONTMATTER_RE = re.compile(r"\A---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", re.DOTA
 
 # Unlimited must be spelled out: UsageLimits() alone defaults to 50 requests.
 NO_LIMITS = UsageLimits(request_limit=None)
-
-READ_DEFAULT_LINE_LENGTH = 1024
-READ_DEFAULT_COLUMN_LENGTH = 1024
-READ_DEFAULT_START_LINE = 1
-READ_DEFAULT_START_COLUMN = 1
-
-WRITE_DEFAULT_START = 0
-WRITE_DEFAULT_END = 0
-
-# Absolute safety fuse. The model cannot override this.
-READ_HARD_OUTPUT_CHARS = 64_000
-
-# Leave room for headers, continuation instructions, etc.
-READ_BODY_BUDGET = 56_000
-
-# Physical scanning is chunked, so a 200 MB one-line minified JS file
-# never becomes one 200 MB Python string.
-READ_SCAN_CHARS = 8_192
 
 # The library surface. Everything here can be imported and used without the
 # CLI; anything not listed is an internal detail and may change.
@@ -403,6 +421,7 @@ class SessionStore:
     resuming a session does not re-summarize or re-prompt anything.
     """
 
+    context_window: int
     schema = "pm-coder-session.v1"
 
     def __init__(self, path: Path, cwd: Path) -> None:
@@ -627,9 +646,9 @@ class Settings(BaseModel):
 
 
 def probe_endpoint(
-    base_url: str, api_key: str, *, timeout: float = 10.0
+    base_url: str, api_key: str, *, timeout: float = 10.0, model: str | None = None
 ) -> dict[str, Any] | None:
-    """Return the first model the endpoint advertises, or None if unreachable.
+    """Return the selected model (or first if unspecified), or None if unreachable.
 
     llama.cpp reports ``meta.n_ctx`` (what a slot can actually fit) alongside
     ``n_ctx_train`` (the model's native length). The runtime budget must
@@ -645,22 +664,16 @@ def probe_endpoint(
     except Exception as exc:
         note(f"{type(exc).__name__}: {exc}; endpoint not answering at {base_url}")
         return None
-    for entry in payload.get("data") or []:
-        if not isinstance(entry, dict) or not entry.get("id"):
-            continue
-        meta = entry.get("meta")
-        n_ctx = meta.get("n_ctx") if isinstance(meta, dict) else None
-        return {
-            "id": str(entry["id"]),
-            "n_ctx": n_ctx if isinstance(n_ctx, int) and n_ctx > 0 else None,
-        }
-    return None
+    entries = payload["data"]
+    entry = next(item for item in entries if item["id"] == model) if model else entries[0]
+    n_ctx = entry["context_length"] if "openrouter.ai" in base_url else entry["meta"]["n_ctx"]
+    return {"id": entry["id"], "n_ctx": n_ctx}
 
 
-def wait_for_endpoint(base_url: str, api_key: str) -> dict[str, Any]:
+def wait_for_endpoint(base_url: str, api_key: str, *, model: str | None = None) -> dict[str, Any]:
     """Block until the endpoint answers. Startup must survive a cold server."""
     while True:
-        capabilities = probe_endpoint(base_url, api_key)
+        capabilities = probe_endpoint(base_url, api_key, model=model)
         if capabilities is not None:
             return capabilities
         note(f"trying reconnect in {RETRY_DELAY_SECONDS:g}s...")
@@ -701,16 +714,12 @@ def build_settings(
 
     capabilities: dict[str, Any] | None = None
     if resolved_model is None or context_window <= 0:
-        capabilities = wait_for_endpoint(resolved_base_url, resolved_api_key)
+        capabilities = wait_for_endpoint(resolved_base_url, resolved_api_key, model=resolved_model)
     if resolved_model is None:
         resolved_model = capabilities["id"]
     if context_window <= 0:
         served = capabilities["n_ctx"]
-        context_window = (
-            max(served - CONTEXT_SAFETY_MARGIN, CONTEXT_SAFETY_MARGIN)
-            if served
-            else FALLBACK_CONTEXT_WINDOW
-        )
+        context_window = served
 
     backend = select_shell(shell)
     resolved_mcp_config = find_mcp_config(cwd_path, mcp_config)
@@ -786,7 +795,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=env_int("LOCAL_AGENT_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW),
         help=(
             "Token budget used to size compaction. 0 (default) reads the "
-            "endpoint's advertised n_ctx and subtracts a safety margin."
+            "selected model's advertised serving context length."
         ),
     )
     parser.add_argument(
@@ -920,10 +929,25 @@ def _terminate_shell_wrapper(process: subprocess.Popen[bytes]) -> bool:
     return True
 
 
-def _capture_bytes(capture: Any) -> str:
-    """Read the current contents of a seekable binary capture file."""
-    capture.seek(0)
-    return capture.read().decode("utf-8", errors="replace")
+def _shell_output_preview(capture: Any, path: Path) -> str:
+    """Read a bounded tail without loading the complete shell output into RAM."""
+    capture.seek(0, os.SEEK_END)
+    size = capture.tell()
+    start = max(0, size - context_limits().shell_chars * 4)
+    capture.seek(start)
+    text = capture.read(size - start).decode("utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    preview = "".join(lines[-context_limits().shell_lines:])[-context_limits().shell_chars:]
+    truncated = start > 0 or preview != text
+    notice = (
+        f"[output truncated: showing only the tail, at most {context_limits().shell_lines} "
+        f"lines / {context_limits().shell_chars} characters]\n"
+        if truncated else ""
+    )
+    return (
+        f"{notice}{preview or '(empty)'}\n"
+        f"[full output: {path} ({size} bytes captured)]"
+    )
 
 
 def _run_host_shell(
@@ -931,6 +955,7 @@ def _run_host_shell(
     cwd: Path,
     command: str,
     timeout_seconds: int,
+    log_dir: Path | None = None,
 ) -> str:
     """Run one shell script with a timeout that cannot be held open by descendants.
 
@@ -942,6 +967,11 @@ def _run_host_shell(
     """
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero")
+    log_root = log_dir or active_session.path / "shell-output"
+    log_root.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(tempfile.mkdtemp(prefix="call_", dir=log_root))
+    stdout_path = output_dir / "stdout.log"
+    stderr_path = output_dir / "stderr.log"
     script_path: str | None = None
     process: subprocess.Popen[bytes] | None = None
     try:
@@ -956,8 +986,8 @@ def _run_host_shell(
             script_path = script_file.name
 
         with (
-            tempfile.TemporaryFile() as stdout_capture,
-            tempfile.TemporaryFile() as stderr_capture,
+            stdout_path.open("w+b") as stdout_capture,
+            stderr_path.open("w+b") as stderr_capture,
         ):
             process = subprocess.Popen(
                 backend.invocation(script_path),
@@ -971,8 +1001,8 @@ def _run_host_shell(
                 returncode = process.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
                 terminated = _terminate_shell_wrapper(process)
-                stdout = _capture_bytes(stdout_capture)
-                stderr = _capture_bytes(stderr_capture)
+                stdout = _shell_output_preview(stdout_capture, stdout_path)
+                stderr = _shell_output_preview(stderr_capture, stderr_path)
                 detail = "" if terminated else "wrapper_terminated: false\n"
                 return (
                     "timed_out: true\n"
@@ -982,8 +1012,8 @@ def _run_host_shell(
                     f"stderr_before_timeout:\n{stderr or '(empty)'}"
                 )
 
-            stdout = _capture_bytes(stdout_capture)
-            stderr = _capture_bytes(stderr_capture)
+            stdout = _shell_output_preview(stdout_capture, stdout_path)
+            stderr = _shell_output_preview(stderr_capture, stderr_path)
             return (
                 f"exit_code: {returncode}\n"
                 f"stdout:\n{stdout or '(empty)'}\n"
@@ -1001,7 +1031,16 @@ def make_shell_tool(settings: Settings) -> Tool[Any]:
     backend = shell_backend(settings)
 
     def host_shell(command: str, timeout_seconds: int = settings.shell_timeout) -> str:
-        """Execute a host-shell script in the selected agent workspace."""
+        """Execute a host-shell script in the selected agent workspace.
+
+        Complete stdout and stderr are saved to separate persistent log files.
+        Each stream returns only its last {shell_lines} lines, capped at
+        {shell_chars} characters.
+        Truncation is explicit; a tail is not proof that earlier output passed.
+        Use read with narrow ranges, or search the reported absolute log paths,
+        for missing details. Do not rerun a command just to retrieve its output.
+        Prefer focused commands such as git log -5 and targeted searches.
+        """
         print(f"\n[{backend.kind}]\n{command.rstrip()}", file=sys.stderr, flush=True)
         result = _run_host_shell(backend, settings.cwd, command, timeout_seconds)
         if result.startswith("timed_out: true"):
@@ -1010,6 +1049,10 @@ def make_shell_tool(settings: Settings) -> Tool[Any]:
             match = re.match(r"exit_code: (-?\d+)", result)
             print(f"[{backend.kind} exit {match.group(1)}]", file=sys.stderr, flush=True)
         return result
+
+    host_shell.__doc__ = host_shell.__doc__.replace(
+        "{shell_lines}", str(context_limits().shell_lines)
+    ).replace("{shell_chars}", str(context_limits().shell_chars))
 
     return Tool(
         host_shell,
@@ -1145,9 +1188,9 @@ def _resolve_read_args(
 ) -> tuple[int, int, int, int]:
     return (
         1 if start_line <= 0 else start_line,
-        READ_DEFAULT_LINE_LENGTH if line_length <= 0 else line_length,
+        context_limits().read_lines if line_length <= 0 else line_length,
         1 if start_column <= 0 else start_column,
-        READ_DEFAULT_COLUMN_LENGTH if column_length <= 0 else column_length,
+        context_limits().read_columns if column_length <= 0 else column_length,
     )
 
 
@@ -1159,7 +1202,7 @@ def _discard_line_tail(handle) -> tuple[bool, bool]:
     had_text = False
 
     while True:
-        chunk = handle.readline(READ_SCAN_CHARS)
+        chunk = handle.readline(8_192)
 
         if chunk == "":
             return had_text, True
@@ -1194,7 +1237,7 @@ def _read_line_slice(
     saw_anything = False
 
     while True:
-        chunk = handle.readline(READ_SCAN_CHARS)
+        chunk = handle.readline(8_192)
 
         if chunk == "":
             return "".join(out), False, True, saw_anything
@@ -1279,7 +1322,7 @@ def _bounded_read_stream(
     # Skip preceding lines in bounded chunks. This remains safe even when
     # one of those physical lines is hundreds of megabytes long.
     while current_line < start_line:
-        chunk = handle.readline(READ_SCAN_CHARS)
+        chunk = handle.readline(8_192)
 
         if chunk == "":
             raise ValueError(
@@ -1294,7 +1337,7 @@ def _bounded_read_stream(
 
         # Keep enough reserve that headers / continuation instructions cannot
         # push the complete tool result beyond the hard output fuse.
-        remaining = READ_BODY_BUDGET - used - len(prefix) - 128
+        remaining = context_limits().read_body_chars - used - len(prefix) - 128
 
         # Prefer stopping at a clean line boundary instead of returning seven
         # random characters from the next ordinary line.
@@ -1402,10 +1445,10 @@ def _bounded_read_stream(
         result += "\n\n" + "\n".join(notes)
 
     # This should be impossible unless somebody later breaks the accounting.
-    if len(result) > READ_HARD_OUTPUT_CHARS:
+    if len(result) > context_limits().read_output_chars:
         raise RuntimeError(
             f"internal read safety invariant broken: "
-            f"{len(result)} > {READ_HARD_OUTPUT_CHARS} characters"
+            f"{len(result)} > {context_limits().read_output_chars} characters"
         )
 
     return result
@@ -1512,10 +1555,10 @@ def _edit_text(
 def make_file_tools(settings: Settings) -> list[Tool[Any]]:
     def read(
             path: str,
-            start_line: int = READ_DEFAULT_START_LINE,
-            line_length: int = READ_DEFAULT_LINE_LENGTH,
-            start_column: int = READ_DEFAULT_START_COLUMN,
-            column_length: int = READ_DEFAULT_COLUMN_LENGTH,
+            start_line: int = 1,
+            line_length: int = context_limits().read_lines,
+            start_column: int = 1,
+            column_length: int = context_limits().read_columns,
     ) -> str:
         """Read a SAFE, BOUNDED window of a text file.
 
@@ -1523,20 +1566,20 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
 
         start_line:
             1-indexed first physical line to read.
-            Default: {READ_DEFAULT_START_LINE}. Pass <= 0 to start at line 1.
+            Default: 1. Pass <= 0 to start at line 1.
 
         line_length:
             Maximum number of physical lines requested.
-            Default: {READ_DEFAULT_LINE_LENGTH}. Pass <= 0 for this default.
+            Default: {read_lines}. Pass <= 0 for this default.
             A positive value overrides that default.
 
         start_column:
             1-indexed character column to start at INSIDE EACH returned line.
-            Default: {READ_DEFAULT_START_COLUMN}. Pass <= 0 to start at column 1.
+            Default: 1. Pass <= 0 to start at column 1.
 
         column_length:
             Maximum number of characters to return FROM EACH selected line.
-            Default: {READ_DEFAULT_COLUMN_LENGTH}. Pass <= 0 for this default.
+            Default: {read_columns}. Pass <= 0 for this default.
             A positive value overrides that default.
 
         NORMAL READ:
@@ -1568,10 +1611,10 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
 
             if (
                 "skill" in str(target).casefold()
-                and (start_line <= 0 or start_line == READ_DEFAULT_START_LINE)
-                and (line_length <= 0 or line_length == READ_DEFAULT_LINE_LENGTH)
-                and (start_column <= 0 or start_column == READ_DEFAULT_START_COLUMN)
-                and (column_length <= 0 or column_length == READ_DEFAULT_COLUMN_LENGTH)
+                and (start_line <= 0 or start_line == 1)
+                and (line_length <= 0 or line_length == context_limits().read_lines)
+                and (start_column <= 0 or start_column == 1)
+                and (column_length <= 0 or column_length == context_limits().read_columns)
             ):
                 line_length = sys.maxsize
                 column_length = sys.maxsize
@@ -1621,15 +1664,17 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
     def write(
             path: str,
             content: str,
-            start: int = WRITE_DEFAULT_START,
-            end: int = WRITE_DEFAULT_END,
+            start: int = 0,
+            end: int = 0,
     ) -> str:
         """Write a whole text file OR replace an exact inclusive line block.
 
-        start and end are optional and both default to {WRITE_DEFAULT_START}.
+        Prefer chunks of at most {write_chunk_chars} characters. This is guidance,
+        not a rejection limit. Use ranged writes to continue a large file.
+        start and end are optional and both default to 0.
 
         WHOLE-FILE WRITE:
-            This is the default: start={WRITE_DEFAULT_START}, end={WRITE_DEFAULT_END}.
+            This is the default: start=0, end=0.
             You can also pass any start <= 0 AND end <= 0.
             Example:
                 write("src/foo.py", content)
@@ -1697,20 +1742,17 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         )
 
     # These must be ordinary docstrings for the tool schema. Substitute the
-    # constants after definition because an f-string would not be a docstring.
+    # limits after definition because an f-string would not be a docstring.
     assert read.__doc__ is not None
     read.__doc__ = (
         read.__doc__
-        .replace("{READ_DEFAULT_START_LINE}", str(READ_DEFAULT_START_LINE))
-        .replace("{READ_DEFAULT_LINE_LENGTH}", str(READ_DEFAULT_LINE_LENGTH))
-        .replace("{READ_DEFAULT_START_COLUMN}", str(READ_DEFAULT_START_COLUMN))
-        .replace("{READ_DEFAULT_COLUMN_LENGTH}", str(READ_DEFAULT_COLUMN_LENGTH))
+        .replace("{read_lines}", str(context_limits().read_lines))
+        .replace("{read_columns}", str(context_limits().read_columns))
     )
     assert write.__doc__ is not None
     write.__doc__ = (
         write.__doc__
-        .replace("{WRITE_DEFAULT_START}", str(WRITE_DEFAULT_START))
-        .replace("{WRITE_DEFAULT_END}", str(WRITE_DEFAULT_END))
+        .replace("{write_chunk_chars}", str(context_limits().write_chunk_chars))
     )
 
     def edit(
@@ -2135,6 +2177,10 @@ def build_system_prompt(
         else: running commands, searching, and verifying results. Project
         instructions define the exact writable paths. Do not escape the
         selected workspace.
+
+        You may read the absolute output-log paths reported by shell tools,
+        including logs outside the workspace. Search or read a narrow range
+        when output was truncated; do not reload the complete log into context.
 
         {bash_machine_note}
 
@@ -2646,7 +2692,7 @@ reads it requires. Later verified facts supersede earlier conflicting claims.
 Distinguish facts from unresolved hypotheses when that matters.
 Do not invent anything.
 
-Write one consolidated checkpoint as compact Markdown, at most 16,000 characters.
+Write one consolidated checkpoint as compact Markdown, at most {summary_chars} characters.
 Merge earlier checkpoints into current state; do not stack historical summaries.
 """
 
@@ -2861,7 +2907,9 @@ async def summarize_text(settings: Settings, text: str) -> str:
         agent = build_summary_agent(settings)
         async with agent:
             result = await agent.run(
-                f"<conversation>\n{text}\n</conversation>\n\n{SUMMARIZATION_PROMPT}",
+                f"<conversation>\n{text}\n</conversation>\n\n" + SUMMARIZATION_PROMPT.replace(
+                    "{summary_chars}", str(context_limits().compact_summary_chars)
+                ),
                 usage_limits=NO_LIMITS,
             )
         return str(result.output).strip()
@@ -2869,7 +2917,7 @@ async def summarize_text(settings: Settings, text: str) -> str:
         if not is_context_failure(exc):
             raise
         mid = len(text) // 2
-        overlap = min(SUMMARY_OVERLAP_CHARS, mid // 2)
+        overlap = min(context_limits().summary_overlap_chars, mid // 2)
         left = text[: mid + overlap]
         right = text[mid - overlap :]
         # If halving cannot shrink the input, something other than the
@@ -2950,7 +2998,7 @@ def strip_images(history: list[Any]) -> list[Any]:
 
 def compaction_tail(history: list[Any], recoveries: int) -> list[Any]:
     """Keep a bounded suffix of complete exchanges, without old checkpoints."""
-    budget = min(COMPACT_TAIL_CHARS, len(serialize_for_summary(history)) // 4)
+    budget = min(context_limits().compact_tail_chars, len(serialize_for_summary(history)) // 4)
     # Normal context exhaustion must not progressively erase recent work.
     # Exclude thinking from retained responses, just as the summarizer does.
     cleaned = [
@@ -2991,11 +3039,11 @@ async def compact(
     # Summarize the whole task, including previous checkpoints and any partial
     # final response, before dropping an unanswered tool call from the tail.
     summary = await summarize(settings, history)
-    while len(summary) > COMPACT_SUMMARY_CHARS:
+    while len(summary) > context_limits().compact_summary_chars:
         summary = await summarize_text(
             settings,
             "Consolidate this checkpoint to at most "
-            f"{COMPACT_SUMMARY_CHARS} characters. Preserve requirements and "
+            f"{context_limits().compact_summary_chars} characters. Preserve requirements and "
             "current task state; replace file contents with paths.\n\n" + summary,
         )
     tail = compaction_tail(drop_unanswered_tail(history), recoveries)
@@ -3443,6 +3491,7 @@ async def open_session(
     discovery = discover_workspace(settings)
     store = SessionStore.open(settings.cwd, run_id, log_root=Path(log_root).expanduser())
     active_session = store
+    active_session.context_window = settings.context_window
     agent = build_agent(
         settings, discovery, store, with_subagent_tool=True, capture_stream=True
     )
@@ -3472,6 +3521,7 @@ async def open_bash_machine_session(
     discovery = discover_workspace(settings)
     store = SessionStore.open(settings.cwd, run_id, log_root=Path(log_root).expanduser())
     active_session = store
+    active_session.context_window = settings.context_window
     agent = build_agent(
         settings, discovery, store,
         bash_machine=bash_machine,

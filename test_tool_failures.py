@@ -54,3 +54,13 @@ def test_plain_skill_read_includes_content_beyond_default_window(tmp_path):
     read = _function(make_file_tools(_settings(tmp_path)), "read")
     assert "FINAL_SKILL_RULE" in read(str(skill))
     assert "FINAL_SKILL_RULE" not in read(str(skill), start_line=1, line_length=10)
+
+
+def setup_module():
+    import tempfile
+    from pathlib import Path
+    import pm_coder
+
+    root = Path(tempfile.mkdtemp(prefix="pm-coder-check-"))
+    pm_coder.active_session = pm_coder.SessionStore.open(root, log_root=root / "sessions")
+    pm_coder.active_session.context_window = 96_000
