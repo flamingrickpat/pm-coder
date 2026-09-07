@@ -1568,10 +1568,10 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
 
             if (
                 "skill" in str(target).casefold()
-                and start_line <= 0
-                and line_length <= 0
-                and start_column <= 0
-                and column_length <= 0
+                and (start_line <= 0 or start_line == READ_DEFAULT_START_LINE)
+                and (line_length <= 0 or line_length == READ_DEFAULT_LINE_LENGTH)
+                and (start_column <= 0 or start_column == READ_DEFAULT_START_COLUMN)
+                and (column_length <= 0 or column_length == READ_DEFAULT_COLUMN_LENGTH)
             ):
                 line_length = sys.maxsize
                 column_length = sys.maxsize
@@ -1654,9 +1654,9 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
 
             content="" with a valid positive range DELETES those lines.
 
-        Re-read the relevant lines immediately before a ranged write if line
-        numbers may have changed. Use edit() instead when exact old text is known
-        and line-number drift would be dangerous.
+        Reuse known line numbers when unchanged. Read only the affected range
+        if edits or external changes made those coordinates uncertain. Use
+        edit() instead when exact old text is already known.
         """
         try:
             target = resolve_path(settings, path)
@@ -2107,6 +2107,17 @@ def build_system_prompt(
         progress, verify every claimed effect, and leave durable evidence when
         useful. Conversation history may continue across requests, so use it as
         context without repeating completed work.
+
+        Conserve tokens. Reuse file contents, discovered facts, and check results
+        already present in your context or checkpoint. Do not repeat repository
+        reconnaissance after compaction. Your own successful edits update that
+        knowledge; they do not require reading the entire file again. Re-read
+        only a narrow missing detail, or content affected by evidence of an
+        external change, an uncertain edit outcome, or an exact-text mismatch.
+        Do not poll files or rerun unchanged baseline checks merely to reassure
+        yourself. Run relevant checks after changes to verify their effects.
+        Provider KV caching is an optimization, not extra memory: use retained
+        context and checkpoint facts, not an assumed cache of omitted content.
 
         Make one tool call per response and wait for its result before
         deciding the next one. Tool calls run strictly in order anyway, so
@@ -2627,7 +2638,10 @@ Do NOT preserve:
   or tools
 
 The filesystem, repository, git working tree, and tools are persistent external
-memory. Prefer saying what should be re-read/re-checked over reproducing it.
+memory. Preserve conclusions from completed reads and checks, with exact paths
+and symbols. Do not turn completed reconnaissance into a list of files to read
+again. Name a specific next implementation or test action and only the narrow
+reads it requires. Later verified facts supersede earlier conflicting claims.
 
 Distinguish facts from unresolved hypotheses when that matters.
 Do not invent anything.
@@ -2641,9 +2655,11 @@ FAKE_USER_RESUME = "/resume"
 CONTEXT_RECOVERY_PROMPT = (
     "The earlier conversation reached the model context window and was "
     "summarized into the checkpoint above. Continue the CURRENT task from that "
-    "checkpoint. Do NOT restart from scratch. Keep making concrete progress on "
-    "the original goal, verify with fresh state, and return the required "
-    "result when you are done."
+    "checkpoint. Do NOT restart reconnaissance or repeat completed reads and "
+    "baseline checks. Trust retained findings unless there is evidence of a "
+    "change or contradiction. Take the next unfinished implementation or test "
+    "action; read only specific missing details needed for it. Verify your "
+    "changes and return the required result when done."
 )
 
 CONTEXT_MARKERS = (
@@ -2861,12 +2877,16 @@ async def summarize_text(settings: Settings, text: str) -> str:
         if len(left) >= len(text) or len(right) >= len(text):
             raise
         note(f"summarizer overflowed at {len(text):,} chars; splitting")
-        return (
+        combined = (
             "[EARLIER PORTION]\n"
             f"{await summarize_text(settings, left)}\n\n"
             "[LATER PORTION]\n"
             f"{await summarize_text(settings, right)}"
         )
+        # Always reconcile split summaries, including contradictory next actions.
+        if len(combined) >= len(text):
+            raise InputTooLarge("Split summaries did not shrink the overflowing input.") from exc
+        return await summarize_text(settings, combined)
 
 
 async def summarize(settings: Settings, messages: list[Any]) -> str:
@@ -2931,7 +2951,7 @@ def strip_images(history: list[Any]) -> list[Any]:
 def compaction_tail(history: list[Any], recoveries: int) -> list[Any]:
     """Keep a bounded suffix of complete exchanges, without old checkpoints."""
     budget = min(COMPACT_TAIL_CHARS, len(serialize_for_summary(history)) // 4)
-    budget //= 2 ** min(recoveries, 16)
+    # Normal context exhaustion must not progressively erase recent work.
     # Exclude thinking from retained responses, just as the summarizer does.
     cleaned = [
         replace(message, parts=[part for part in message.parts
