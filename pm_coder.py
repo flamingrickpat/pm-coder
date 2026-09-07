@@ -1605,7 +1605,12 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         """
         try:
             target = resolve_path(settings, path)
-            print(f"\n[read {target}]", file=sys.stderr, flush=True)
+            print(
+                f"\n[read {target} start_line={start_line} line_length={line_length} "
+                f"start_column={start_column} column_length={column_length}]",
+                file=sys.stderr,
+                flush=True,
+            )
             if not target.is_file():
                 raise FileNotFoundError(f"file does not exist: {target}")
 
@@ -1810,7 +1815,11 @@ def make_virtual_file_tools(bash_machine: Any) -> list[Tool[Any]]:
     """
 
     def read(path: str, offset: int = 1, limit: int = 0) -> str:
-        print(f"\n[read :{path}]", file=sys.stderr, flush=True)
+        print(
+            f"\n[read :{path} offset={offset} limit={limit}]",
+            file=sys.stderr,
+            flush=True,
+        )
         try:
             raw = bash_machine.read_text(path)
         except Exception as exc:
