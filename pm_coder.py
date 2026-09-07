@@ -38,10 +38,11 @@ import asyncio
 import difflib
 import itertools
 import json
-import math
 import os
+import random
 import re
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -117,37 +118,14 @@ DEFAULT_CONTEXT_WINDOW = 0
 CONTEXT_SAFETY_MARGIN = 2_048
 FALLBACK_CONTEXT_WINDOW = 65_536
 
-# Fraction of the pre-compaction history a compaction keeps verbatim, split
-# across its two edges. A first compaction should land at roughly half the
-# size it started from (90k -> ~45k), not at a fixed few thousand tokens
-# that vaporize an all-night session's detail. Consecutive recoveries still
-# halve whatever was chosen, so a history that keeps overflowing keeps
-# converging instead of stalling.
-COMPACT_KEEP_FRACTION = 0.5
-# Per-edge cap relative to the context window: the verbatim edges plus the
-# checkpoint summary must leave room for the next generation to run.
-EDGE_WINDOW_FRACTION = 0.25
-MIN_EDGE_TOKENS = 256
-# Growth since the previous compaction that counts as the model having done
-# real work, rather than having overflowed again straight away.
-PROGRESS_TOKENS = 2_048
-# A single turn larger than this fraction of the window is compacted on its
-# own before anything else: one fat coding turn must not permanently occupy
-# every future request.
-FAT_TURN_FRACTION = 0.20
-# The summarizer is fed text, not tokens; splitting by characters is enough.
+# Character limits bound retained text; they do not predict server capacity.
+COMPACT_TAIL_CHARS = 48_000
+COMPACT_SUMMARY_CHARS = 16_000
 SUMMARY_OVERLAP_CHARS = 6_000
-# Flat per-image budget for the context estimator. The real vision cost is
-# deployment specific, but compaction only needs relative sizes.
-IMAGE_TOKENS = 400
 
 # One agent.run can last all night, so the history is snapshotted mid-turn
 # after a tool call, at most this often.
 SNAPSHOT_SECONDS = 30.0
-# Fraction of the context window above which a truncated response is treated
-# as the context running out. Below it, the response merely outgrew
-# --max-tokens, and summarizing would throw away detail for nothing.
-COMPACT_ABOVE = 0.75
 
 # Images are pruned from the stored history with a high/low watermark. While
 # the history holds at most IMAGE_HIGH_WATER images nothing is touched, so
@@ -172,8 +150,8 @@ FRONTMATTER_RE = re.compile(r"\A---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", re.DOTA
 # Unlimited must be spelled out: UsageLimits() alone defaults to 50 requests.
 NO_LIMITS = UsageLimits(request_limit=None)
 
-READ_DEFAULT_LINE_LENGTH = 8_192
-READ_DEFAULT_COLUMN_LENGTH = 4_096
+READ_DEFAULT_LINE_LENGTH = 1024
+READ_DEFAULT_COLUMN_LENGTH = 1024
 READ_DEFAULT_START_LINE = 1
 READ_DEFAULT_START_COLUMN = 1
 
@@ -430,6 +408,8 @@ class SessionStore:
     def __init__(self, path: Path, cwd: Path) -> None:
         self.path = path
         self.cwd = cwd.resolve()
+        self.turn_id = ""
+        self.auto_compact_cnt = 0
         self.metadata_path = path / "session.json"
         self.messages_path = path / "messages.json"
         self.runs_path = path / "runs.jsonl"
@@ -572,7 +552,6 @@ class SessionStore:
 # route to the active session, so the store is published here at open time.
 active_session: SessionStore | None = None
 
-
 @dataclass(init=False)
 class LoggingOpenAIChatModel(OpenAIChatModel):
     """OpenAIChatModel that dumps every /chat/completions body to the session.
@@ -607,18 +586,22 @@ class LoggingOpenAIChatModel(OpenAIChatModel):
         if active_session is None:
             return
 
-        #try:
-        #    raw = bytes(request.content)
-        #    payload = json.loads(raw)
-        #    sequence = next(self._log_counter)
-        #    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        #    stem = active_session.path / f"{timestamp}_{sequence:06d}"
-        #    stem.with_suffix(".compact.json").write_bytes(raw)
-        #    stem.with_suffix(".pretty.json").write_text(
-        #        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        #    )
-        #except Exception as exc:
-        #    note(f"prompt logger failed: {exc!r}")
+        try:
+            raw = bytes(request.content)
+            payload = json.loads(raw)
+            dump = json.dumps(payload, ensure_ascii=False, indent=2)
+
+            sequence = next(self._log_counter)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            stem = active_session.path / f"turn_{active_session.turn_id}_ac_{active_session.auto_compact_cnt}.json"
+            if stem.exists():
+                try:
+                    os.remove(stem)
+                except:
+                    stem = stem / f"{timestamp}.json"
+            stem.write_text(dump, encoding="utf-8")
+        except Exception as exc:
+            note(f"prompt logger failed: {exc!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -1565,6 +1548,12 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         READ THE NEXT 4000 CHARACTERS OF A HUGE ONE-LINE FILE:
             read("bundle.min.js", 1, 1, 4001, 4000)
 
+        SKILL FILES: if any part of the path contains "skill" (case-insensitive,
+        e.g. skills/item-implementer-auto/SKILL.md), a plain read(path) returns
+        the WHOLE file regardless of the numeric defaults. Pass explicit
+        coordinates only if you deliberately want a slice of it. A skill larger
+        than the hard output limit falls back to bounded reading and says so.
+
         Long physical lines are never loaded whole. They are scanned in chunks.
 
         Positive line_length/column_length values may request larger windows, but
@@ -1576,6 +1565,16 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
             print(f"\n[read {target}]", file=sys.stderr, flush=True)
             if not target.is_file():
                 raise FileNotFoundError(f"file does not exist: {target}")
+
+            if (
+                "skill" in str(target).casefold()
+                and start_line <= 0
+                and line_length <= 0
+                and start_column <= 0
+                and column_length <= 0
+            ):
+                line_length = sys.maxsize
+                column_length = sys.maxsize
 
             with target.open(
                 "r",
@@ -2600,76 +2599,7 @@ def build_summary_agent(settings: Settings) -> Agent[Any, str]:
 
 
 # ---------------------------------------------------------------------------
-# Context estimation
-#
-# Only relative sizes matter here: which turn is the fattest, and where the
-# verbatim edges of a compaction should fall. Four characters per token is
-# close enough for that, and images get one flat budget rather than a probe.
-# ---------------------------------------------------------------------------
-
-
-def _json_length(value: Any) -> int:
-    return len(json.dumps(value, default=str, sort_keys=True))
-
-
-def _block_chars(block: Any) -> int:
-    """Characters attributable to one element of a multi-part content list."""
-    if isinstance(block, str):
-        return len(block)
-    if not isinstance(block, dict):
-        return _json_length(block)
-    if block.get("kind") == "binary":
-        # An image costs vision tokens, not the length of its base64 payload.
-        return IMAGE_TOKENS * 4
-    if isinstance(block.get("text"), str):
-        return len(block["text"])
-    if block.get("type") == "tool-call" or block.get("part_kind") == "tool-call":
-        return len(block.get("tool_name") or "") + _json_length(block.get("args"))
-    return _json_length(block)
-
-
-def estimate_message_tokens(message: dict[str, Any]) -> int:
-    chars = 0
-    for part in message["parts"]:
-        kind = part.get("part_kind") or part.get("kind")
-        if kind == "tool-call":
-            chars += len(part.get("tool_name") or "") + _json_length(part.get("args"))
-            continue
-        content = part.get("content")
-        if isinstance(content, str):
-            chars += len(content)
-        elif isinstance(content, list):
-            chars += sum(_block_chars(block) for block in content)
-        elif content is not None:
-            chars += _json_length(content)
-    return max(1, math.ceil(chars / 4))
-
-
-def estimate_context_tokens(data: list[dict[str, Any]]) -> int:
-    """Prefer the endpoint's own count from the newest response it answered."""
-    for index in range(len(data) - 1, -1, -1):
-        message = data[index]
-        if message.get("kind") != "response":
-            continue
-        usage = message.get("usage")
-        total = usage.get("total_tokens") if isinstance(usage, dict) else None
-        if isinstance(total, int) and total > 0:
-            return total + sum(estimate_message_tokens(m) for m in data[index + 1 :])
-        break
-    return sum(estimate_message_tokens(m) for m in data)
-
-
-def count_tokens(messages: list[Any]) -> int:
-    return estimate_context_tokens(to_jsonable_python(messages))
-
-
-# ---------------------------------------------------------------------------
-# Compaction
-#
-# Reactive only: nothing is summarized until the endpoint says the context is
-# full or a response comes back truncated. Three strategies escalate, and each
-# consecutive recovery halves the verbatim edges it preserves, so a history
-# that keeps overflowing keeps shrinking instead of stalling.
+# Compaction: triggered only by endpoint rejection or truncated generation.
 # ---------------------------------------------------------------------------
 
 SUMMARIZATION_PROMPT = """
@@ -2702,16 +2632,9 @@ memory. Prefer saying what should be re-read/re-checked over reproducing it.
 Distinguish facts from unresolved hypotheses when that matters.
 Do not invent anything.
 
-Write the checkpoint as compact Markdown.
+Write one consolidated checkpoint as compact Markdown, at most 16,000 characters.
+Merge earlier checkpoints into current state; do not stack historical summaries.
 """
-
-TRUNCATION_FEEDBACK = (
-    "Your previous response was cut off when it reached the per-response token "
-    "limit. Whatever it managed to produce is above, unfinished. Continue from "
-    "exactly where it stopped instead of starting over, and keep each single "
-    "response smaller: write a long file as several `edit` calls rather than "
-    "one enormous `write`."
-)
 
 FAKE_USER_RESUME = "/resume"
 
@@ -3005,130 +2928,31 @@ def strip_images(history: list[Any]) -> list[Any]:
     return stripped
 
 
-def is_user_turn(message: Any) -> bool:
-    return isinstance(message, ModelRequest) and any(
-        isinstance(part, UserPromptPart) for part in message.parts
-    )
-
-
-def turn_ranges(history: list[Any]) -> list[tuple[int, int]]:
-    """Half-open [start, end) index ranges, one per user-initiated turn."""
-    starts = [index for index, message in enumerate(history) if is_user_turn(message)]
-    return [
-        (start, starts[n + 1] if n + 1 < len(starts) else len(history))
-        for n, start in enumerate(starts)
+def compaction_tail(history: list[Any], recoveries: int) -> list[Any]:
+    """Keep a bounded suffix of complete exchanges, without old checkpoints."""
+    budget = min(COMPACT_TAIL_CHARS, len(serialize_for_summary(history)) // 4)
+    budget //= 2 ** min(recoveries, 16)
+    # Exclude thinking from retained responses, just as the summarizer does.
+    cleaned = [
+        replace(message, parts=[part for part in message.parts
+                                if getattr(part, "part_kind", "") != "thinking"])
+        if isinstance(message, ModelResponse) else message
+        for message in history
     ]
-
-
-async def compact_one_turn(
-    settings: Settings,
-    turn: list[Any],
-    edge_tokens: int,
-    stream_savepoint_path: Path | None,
-) -> list[Any] | None:
-    """Summarize the interior of one turn, keeping verbatim head and tail.
-
-    A turn is UserRequest, Response, ToolReturn, Response, ToolReturn, ... so
-    cutting immediately before a ModelResponse leaves the head ending in a
-    request and the tail starting in a response. The checkpoint is prepended
-    to that response, which keeps every tool-call/tool-return pair intact.
-    """
-    cuts = [index for index, message in enumerate(turn) if isinstance(message, ModelResponse)]
-    # A turn smaller than both edges cannot keep them verbatim; quarter the
-    # turn instead so this still lands near half its size rather than
-    # falling through to collapse_largest_turn's request-plus-summary.
-    edge_tokens = min(edge_tokens, max(MIN_EDGE_TOKENS, count_tokens(turn) // 4))
-    head_cuts = [index for index in cuts if count_tokens(turn[:index]) >= edge_tokens]
-    tail_cuts = [index for index in cuts if count_tokens(turn[index:]) >= edge_tokens]
-    if not head_cuts or not tail_cuts:
-        return None
-    head_cut, tail_cut = head_cuts[0], tail_cuts[-1]
-    if tail_cut <= head_cut:
-        return None
-    # Summarize the WHOLE turn, not merely the omitted middle: the preserved
-    # edges give exact detail, and this gives coherent state around them.
-    summary = await summarize(settings, turn)
-    head = list(turn[:head_cut])
-    tail = list(turn[tail_cut:])
-    tail[0] = replace(
-        tail[0],
-        parts=[
-            checkpoint_part(summary, stream_savepoint_path),
-            *tail[0].parts,
-        ],
-    )
-    return head + tail
-
-
-async def compact_middle_turns(
-    settings: Settings,
-    history: list[Any],
-    edge_tokens: int,
-    stream_savepoint_path: Path | None,
-) -> list[Any] | None:
-    """Keep whole turns at both ends verbatim; summarize the whole turns between."""
-    ranges = turn_ranges(history)
-    if len(ranges) < 3:
-        return None
-    left = 0
-    kept = 0
-    while left < len(ranges) - 1 and kept < edge_tokens:
-        start, end = ranges[left]
-        kept += count_tokens(history[start:end])
-        left += 1
-    right = len(ranges)
-    kept = 0
-    while right > left + 1 and kept < edge_tokens:
-        right -= 1
-        start, end = ranges[right]
-        kept += count_tokens(history[start:end])
-    if right <= left:
-        return None
-    middle_start = ranges[left][0]
-    middle_end = ranges[right][0]
-    summary = await summarize(settings, history[middle_start:middle_end])
-    head = list(history[:middle_start])
-    tail = list(history[middle_end:])
-    # The middle starts at a fresh user turn, so the turn before it ends in a
-    # ModelResponse. Attach the assistant-generated memory there.
-    head[-1] = replace(
-        head[-1],
-        parts=[
-            *head[-1].parts,
-            checkpoint_part(summary, stream_savepoint_path),
-        ],
-    )
-    return head + tail
+    for index, message in enumerate(cleaned):
+        if index == 0 or not isinstance(message, ModelResponse):
+            continue
+        tail = cleaned[index:]
+        text = serialize_for_summary(tail)
+        if "[AUTOCOMPACTED EXECUTION CHECKPOINT]" in text:
+            continue
+        if len(text) <= budget:
+            return tail
+    return []
 
 
 class InputTooLarge(RuntimeError):
-    """The largest turn is a single unanswered request -- nothing to shrink."""
-
-
-async def collapse_largest_turn(
-    settings: Settings,
-    history: list[Any],
-    stream_savepoint_path: Path | None,
-) -> list[Any]:
-    """Last resort: keep one turn's user request and replace all of its work."""
-    ranges = turn_ranges(history)
-    start, end = max(ranges, key=lambda r: count_tokens(history[r[0] : r[1]]))
-    turn = history[start:end]
-    if not any(isinstance(message, ModelResponse) for message in turn):
-        # A turn this fat with no ModelResponse in it is just the raw request
-        # -- there is no generated content to summarize away, so every other
-        # strategy already failed and this one would only bolt a checkpoint
-        # onto an unanswered request, silently swapping it for a fresh prompt
-        # on resume. Say so and stop instead of pretending we fixed it.
-        raise InputTooLarge("Input way too long, autocompact won't help.")
-    summary = await summarize(settings, turn)
-    collapsed = [
-        turn[0],
-        ModelResponse(
-            parts=[checkpoint_part(summary, stream_savepoint_path)]
-        ),
-    ]
-    return history[:start] + collapsed + history[end:]
+    """The history contains no generated work to summarize."""
 
 
 async def compact(
@@ -3137,62 +2961,32 @@ async def compact(
     recoveries: int,
     session: SessionStore | None = None,
 ) -> list[Any]:
-    """Shrink one history, preserving as much recent detail as still fits.
-
-    The verbatim edges are sized from the history being compacted -- roughly
-    half of it survives a first compaction -- instead of a fixed few thousand
-    tokens. A fixed budget turned a 90k-token all-night session into 8k in
-    one step; proportional edges turn it into ~45k, and the escalation in
-    ``run_turn.recover`` still halves them whenever that proves too generous.
-    """
+    """Replace execution history with one checkpoint and a bounded recent tail."""
     session = session or active_session
-    stream_savepoint_path = session.save_stream_savepoint() if session is not None else None
+    stream_path = session.save_stream_savepoint() if session is not None else None
     history = strip_images(list(history))
-    # A truncated trailing response is the thing that just failed. Dropping it
-    # leaves the history ending in tool results, which lets the model resume
-    # generating from exactly where it ran out of room.
-    while history and isinstance(history[-1], ModelResponse):
-        history.pop()
+    if not any(isinstance(message, ModelResponse) for message in history):
+        raise InputTooLarge("Input way too long, autocompact won't help.")
 
-    before = count_tokens(history)
-    edge_tokens = max(
-        MIN_EDGE_TOKENS,
-        min(
-            int(before * COMPACT_KEEP_FRACTION) // 2,
-            int(settings.context_window * EDGE_WINDOW_FRACTION),
+    # Summarize the whole task, including previous checkpoints and any partial
+    # final response, before dropping an unanswered tool call from the tail.
+    summary = await summarize(settings, history)
+    while len(summary) > COMPACT_SUMMARY_CHARS:
+        summary = await summarize_text(
+            settings,
+            "Consolidate this checkpoint to at most "
+            f"{COMPACT_SUMMARY_CHARS} characters. Preserve requirements and "
+            "current task state; replace file contents with paths.\n\n" + summary,
         )
-        // (2**recoveries),
-    )
-
-    # First: kill fat turns. One completed 30k-token coding turn must not
-    # permanently consume 30k tokens of every future request.
-    changed = False
-    for start, end in reversed(turn_ranges(history)):
-        turn = history[start:end]
-        if count_tokens(turn) <= settings.context_window * FAT_TURN_FRACTION:
-            continue
-        compacted = await compact_one_turn(
-            settings, turn, edge_tokens, stream_savepoint_path
-        )
-        if compacted is None:
-            continue
-        history[start:end] = compacted
-        changed = True
-    if changed:
-        return history
-
-    # No single fat turn: preserve both conversation edges and summarize the
-    # complete turns in between.
-    compacted = await compact_middle_turns(
-        settings, history, edge_tokens, stream_savepoint_path
-    )
-    if compacted is not None:
-        return compacted
-
-    # Nothing clever left. Collapse the fattest turn down to its request.
-    return await collapse_largest_turn(
-        settings, history, stream_savepoint_path
-    )
+    tail = compaction_tail(drop_unanswered_tail(history), recoveries)
+    checkpoint = checkpoint_part(summary, stream_path)
+    if tail:
+        tail[0] = replace(tail[0], parts=[checkpoint, *tail[0].parts])
+    else:
+        tail = [ModelResponse(parts=[checkpoint])]
+    # Keep the original instructions exact. Everything after them is covered
+    # by the consolidated checkpoint, irrespective of synthetic user turns.
+    return [history[0], *tail]
 
 
 # ---------------------------------------------------------------------------
@@ -3463,7 +3257,6 @@ async def run_turn(
 
     * out of context -> compact the history and resume from the last tool
       result;
-    * a response truncated with context to spare -> keep it and continue;
     * the model stuck on its own output (unparseable generation, or arguments
       it cannot repair) -> nudge it with a fresh user turn;
     * anything else -> say so, wait, and retry the same turn.
@@ -3474,37 +3267,15 @@ async def run_turn(
     history = session.load_messages()
     next_prompt: str | None = prompt
     recoveries = 0
-    floor: int | None = None  # size the previous compaction reached
     started = time.perf_counter()
+    active_session.turn_id = ''.join(random.SystemRandom().choice(string.ascii_uppercase + string.digits) for _ in range(6))
+    active_session.auto_compact_cnt = 0
 
-    async def recover(reason: str, *, force_compact: bool) -> str | None:
-        """Make room, then say what to send next.
-
-        ``force_compact`` is set when the endpoint itself rejected the request
-        for length -- our token estimate does not get a vote against that.
-        Otherwise a truncated response with the context still mostly empty
-        just means the answer outgrew --max-tokens, and summarizing would
-        discard detail to solve a problem summarizing cannot solve.
-        """
-        nonlocal history, recoveries, floor
-        before = count_tokens(history)
-        if not force_compact and before < settings.context_window * COMPACT_ABOVE:
-            history = drop_unanswered_tail(history)
-            session.save_messages(history)
-            note(f"{reason}; ~{before:,} tokens of {settings.context_window:,} used, "
-                 "so this is the response limit, not the context. Continuing.")
-            return resume_prompt(history, TRUNCATION_FEEDBACK)
-        # Escalate only while stuck. Coming back here having barely grown
-        # since the last compaction means that level of detail was still too
-        # expensive, so halve the verbatim edges; coming back after real work
-        # means it was affordable, so start over at full detail. Without the
-        # reset a session that compacts all night would pin itself to the
-        # minimum edges forever and throw away far more than it needs to.
-        stuck = floor is not None and before <= floor + PROGRESS_TOKENS
-        recoveries = recoveries + 1 if stuck else 0
-        note(f"{reason}; compacting ~{before:,} tokens (recovery level {recoveries})")
+    async def recover(reason: str) -> str | None:
+        nonlocal history, recoveries
+        note(f"{reason}; compacting (recovery level {recoveries})")
         history = await compact(settings, history, recoveries, session)
-        floor = count_tokens(history)
+        recoveries += 1
         session.save_messages(history)
         # The stats view rides into the next request as a fake user turn:
         # what was done since the last checkpoint, so the model does not
@@ -3515,13 +3286,8 @@ async def run_turn(
             + session.tool_stats_report()
         )
         session.tool_calls.clear()
-        if floor >= before:
-            # Already as small as this strategy can make it. Retrying
-            # immediately would just summarize the same messages forever.
-            note(f"compaction bottomed out at ~{floor:,} tokens; waiting")
-            await asyncio.sleep(RETRY_DELAY_SECONDS)
-        else:
-            note(f"compacted to ~{floor:,} tokens; resuming")
+        active_session.auto_compact_cnt += 1
+        note("compacted to one checkpoint plus recent exchanges; resuming")
         return resume_prompt(history, CONTEXT_RECOVERY_PROMPT)
 
     while True:
@@ -3566,8 +3332,6 @@ async def run_turn(
                 # compact
                 next_prompt = await recover(
                     f"out of room ({type(exc).__name__})",
-                    # The endpoint refusing the request outranks our estimate.
-                    force_compact=is_context_failure(exc),
                 )
             else:
                 # reconnect. The exception may have struck between the model
@@ -3591,7 +3355,7 @@ async def run_turn(
             # The response came back whole enough to parse but stopped
             # mid-thought. Same cause as the raising cases, same cure.
             next_prompt = await recover(
-                "response hit the generation limit", force_compact=False
+                "response hit the generation limit"
             )
             continue
 
