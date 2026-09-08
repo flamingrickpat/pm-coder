@@ -3,7 +3,7 @@
 ## minimal coding agent with mcp and skills for local llms like qwen 3.6
 
 Unattended coding agent for local OpenAI-compatible models, with MCP
-discovery, project instructions, skills, and read/read_image/write/edit/shell
+discovery, project instructions, skills, and read/write/edit/shell
 tools.
 Built to be started once and left running: no request limits, no wall-clock
 limits, and a single recovery loop that compacts its own context and
@@ -62,13 +62,12 @@ process.
 
 ## Tools
 
-Five built-in tools, plus whatever the MCP servers contribute:
+Four built-in tools, plus whatever the MCP servers contribute:
 
 | Tool | Signature | Notes |
 | --- | --- | --- |
-| `read` | `read(path, start_line=1, line_length=…, start_column=1, column_length=…)` | Bounded, line-numbered window; the defaults and hard cap scale with the model's context size. Pass `0` everywhere for a full read. |
-| `read_image` | `read_image(path)` | Attaches a JPG or PNG to the conversation as a base64 image, so a vision-capable model can see it. |
-| `write` | `write(path, content, start=0, end=0)` | Whole file by default; a positive inclusive `start`–`end` range replaces (or with empty content, deletes) those lines. Always UTF-8, no BOM. |
+| `read` | `read(path, start_line=1, line_length=…, start_column=1, column_length=…)` | Text files come back as a bounded, line-numbered window whose defaults and hard cap scale with the model's context size; `0` everywhere means full read. JPG/PNG files come back as image attachments the model can see. |
+| `write` | `write(path, content, start=0, end=0)` | Creates or fully rewrites a file, creating parent directories. A positive inclusive `start`–`end` range replaces (or with empty content, deletes) those lines. Always UTF-8, no BOM. |
 | `edit` | `edit(path, old_string, new_string, replace_all=False)` | Exact string match, must be unique unless `replace_all`. |
 | `powershell` / `bash` | `(command, timeout_seconds)` | Everything else: running, searching, verifying. Named after the selected backend. |
 
@@ -91,11 +90,13 @@ escape the same content twice -- once for the tool-call JSON, once for the
 shell -- and PowerShell 5.1's `Set-Content` silently writes the system ANSI
 codepage rather than UTF-8.
 
-`read_image` is the visual counterpart of `read`: the file's bytes come back
-as `BinaryContent`, which Pydantic AI renders as a base64 `image_url` user
+`read` is also the way to look at pictures: a JPG or PNG comes back as
+`BinaryContent`, which Pydantic AI renders as a base64 `image_url` user
 message -- the same wire path MCP screenshots already take. Images are
 dropped first when compaction needs room, and require a vision-capable model
-(e.g. qwen-vl) to actually be understood.
+served with a projector (e.g. llama.cpp `--mmproj`) to actually be understood;
+without one the run fails loudly on the endpoint's 500 instead of retrying
+an unanswerable request forever.
 
 ## Options
 
@@ -287,7 +288,7 @@ print(result.stdout)
 ```
 
 The virtual filesystem stays available for the lifetime of the `BashMachine` object.
-Agents running on a machine get the same `read`/`read_image`/`write`/`edit`
+Agents running on a machine get the same `read`/`write`/`edit`
 tools with the same signatures as on the real filesystem -- `make_file_tools`
 simply switches its storage backend to the machine.
 

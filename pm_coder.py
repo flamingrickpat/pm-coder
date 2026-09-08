@@ -449,10 +449,6 @@ class SessionStore:
         # Text the next model request gets as a fake user turn: a loop alert
         # or the compaction stats view. Cleared once injected.
         self.pending_alert: str | None = None
-        # Set False the first time the endpoint rejects an image; read_image
-        # then answers with text instead of attaching one the endpoint will
-        # keep rejecting.
-        self.vision_supported = True
 
     def record_tool_call(self, name: str, tool_args: dict[str, Any]) -> None:
         """Count one normalized tool call, and flag a loop when it repeats."""
@@ -1116,9 +1112,6 @@ def make_bash_machine_tool(machine: Any, user: str) -> Tool[Any]:
 # fails loudly and can be retried, while a wrong line range succeeds and
 # deletes the wrong code, which is not a failure an unattended run survives.
 # Line numbers appear only in `read` output, to be quoted back verbatim.
-# read_image is the visual variant: Pydantic AI turns a BinaryContent tool
-# return into a base64 image_url user message, so the tool just hands the
-# bytes back and the framework does the rest.
 # ---------------------------------------------------------------------------
 
 
@@ -1591,7 +1584,7 @@ class VirtualFiles:
 
 
 def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[Any]]:
-    """Build read/read_image/write/edit against one storage backend.
+    """Build read/write/edit against one storage backend.
 
     With ``bash_machine=None`` the tools operate on the real workspace under
     ``settings.cwd``. With a BashMachine they operate on its in-memory
@@ -1606,43 +1599,35 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
             line_length: int = context_limits().read_lines,
             start_column: int = 1,
             column_length: int = context_limits().read_columns,
-    ) -> str:
-        """Read a SAFE, BOUNDED window of a text file.
+    ):
+        """Read the contents of a file. Supports text files and images (jpg, png).
+        Images are attached to the conversation so you can see them.
 
-        Numeric arguments are optional. Their defaults are shown below.
+        path: file to read, relative to the working directory or absolute.
 
-        start_line:
-            1-indexed first physical line to read.
-            Default: 1. Pass <= 0 to start at line 1.
+        TEXT FILES return a bounded, line-numbered window sized to your context:
+            start_line:    1-indexed first line. Default 1 (<=0 means 1).
+            line_length:   max lines to return. Default {read_lines} (<=0 means default).
+            start_column:  1-indexed first character column inside each line. Default 1.
+            column_length: max characters per line. Default {read_columns}.
 
-        line_length:
-            Maximum number of physical lines requested.
-            Default: {read_lines}. Pass <= 0 for this default.
-            A positive value overrides that default.
+        Long lines are clipped, never loaded whole. When output stops early the
+        result prints exact continuation coordinates -- pass them back in the
+        next call to continue where you left off.
 
-        start_column:
-            1-indexed character column to start at INSIDE EACH returned line.
-            Default: 1. Pass <= 0 to start at column 1.
+        CONTEXT-SAVING RULES:
+            - Locate code with the shell first (grep -Rni), then read ONLY the
+              lines you need. Never read a whole file to find one function.
+            - Do not re-read what you already have in context. Your own
+              successful write/edit calls update that knowledge.
+            - A full read is read(path, 0, 0, 0, 0). Use it only for files you
+              know are small.
 
-        column_length:
-            Maximum number of characters to return FROM EACH selected line.
-            Default: {read_columns}. Pass <= 0 for this default.
-            A positive value overrides that default.
-
-        READ 100 LINES STARTING AT LINE 500:
-            read("src/foo.py", 500, 100, 0, 0)
-
-        READ THE NEXT 4000 CHARACTERS OF A HUGE ONE-LINE FILE:
-            read("bundle.min.js", 1, 1, 4001, 4000)
-
-        DANGEROUS FULL READ (use this only for files you know won't overflow the context quickly) :
-            read("src/foo.py", 0, 0, 0, 0)
-
-        Long physical lines are never loaded whole. They are scanned in chunks.
-
-        Positive line_length/column_length values may request larger windows, but
-        an absolute tool-output safety limit can stop the result earlier. ALWAYS
-        follow the continuation coordinates printed by the tool when that happens.
+        EXAMPLES:
+            read("src/foo.py")                       first {read_lines} lines
+            read("src/foo.py", 500, 100)             lines 500-599
+            read("bundle.min.js", 1, 1, 4001, 4000)  next 4000 chars of a huge one-line file
+            read("diagram.png")                      attach the image itself
         """
         try:
             target = files.resolve(path)
@@ -1654,6 +1639,19 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
             )
             if not files.is_file(target):
                 raise FileNotFoundError(f"file does not exist: {target}")
+
+            media_type = IMAGE_MEDIA_TYPES.get(Path(str(target)).suffix.lower())
+            if media_type is not None:
+                # Pydantic AI turns a BinaryContent tool return into a base64
+                # image_url user message; the framework does the rest. If the
+                # endpoint has no projector, run_turn fails loudly on its 500.
+                data = files.read_bytes(target)
+                if not data:
+                    raise ValueError(f"file is empty: {target}")
+                return [
+                    BinaryContent(data, media_type=media_type),
+                    f"image attached: {target} ({len(data):,} bytes)",
+                ]
 
             if (
                 "skill" in str(target).casefold()
@@ -1678,81 +1676,36 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
         except Exception as exc:
             return tool_failure(exc)
 
-    def read_image(path: str):
-        """Attach a JPG or PNG image to the conversation so the model can see
-        it. The image is returned alongside a short text confirmation; the
-        model receives both as visual input. Use this for screenshots,
-        diagrams, or any picture the task refers to.
-        """
-        target = files.resolve(path)
-        print(f"\n[read_image {target}]", file=sys.stderr, flush=True)
-        if not active_session.vision_supported:
-            return [
-                "error: this endpoint does not support image input (the server "
-                "was started without a projector, e.g. llama.cpp --mmproj); "
-                "work from text evidence instead"
-            ]
-        if not files.is_file(target):
-            return [f"error: file does not exist: {target}"]
-        suffix = Path(str(target)).suffix.lower()
-        media_type = IMAGE_MEDIA_TYPES.get(suffix)
-        if media_type is None:
-            return [
-                f"error: unsupported image type {suffix or '(none)'} in "
-                f"{target}; use .jpg, .jpeg, or .png"
-            ]
-        try:
-            data = files.read_bytes(target)
-        except Exception as exc:
-            return [f"error: cannot read {target}: {exc}"]
-        if not data:
-            return [f"error: file is empty: {target}"]
-        return [
-            BinaryContent(data, media_type=media_type),
-            f"image attached: {target} ({len(data):,} bytes)",
-        ]
-
     def write(
             path: str,
             content: str,
             start: int = 0,
             end: int = 0,
     ) -> str:
-        """Write a whole text file OR replace an exact inclusive line block.
+        """Write content to a file. Creates the file if it doesn't exist,
+        overwrites if it does. Automatically creates parent directories.
 
-        Prefer chunks of at most {write_chunk_chars} characters. This is guidance,
-        not a rejection limit. Use ranged writes to continue a large file.
-        start and end are optional and both default to 0.
+        USE THIS FOR:
+            - a new file
+            - a deliberate full rewrite
+            Use edit() to CHANGE existing content: it fails loudly when the
+            old text does not match, where a rewrite silently destroys work.
 
-        WHOLE-FILE WRITE:
-            This is the default: start=0, end=0.
-            You can also pass any start <= 0 AND end <= 0.
-            Example:
-                write("src/foo.py", content)
+        WHOLE-FILE WRITE (the default: start=0, end=0):
+            write("src/foo.py", content)
 
-            This creates a missing file or completely replaces an existing file.
+        BLOCK REPLACEMENT (start > 0 AND end > 0, 1-indexed, INCLUSIVE):
+            write("src/foo.py", replacement, 20, 35)
+            Replaces lines 20 THROUGH 35. content="" deletes those lines.
+            Use it to continue a large file in chunks of at most
+            {write_chunk_chars} characters.
 
-        BLOCK REPLACEMENT:
-            Pass start > 0 AND end > 0.
-            start/end are 1-indexed and INCLUSIVE.
-            Example:
-                write("src/foo.py", replacement, 20, 35)
+        INVALID requests return an error instead of guessing: mixed ranges
+            (start <= 0, end > 0), start > end, ranges outside the file,
+            ranged writes to a file that does not exist.
 
-            This replaces existing lines 20 THROUGH 35 with content.
-
-        IMPORTANT:
-            start <= 0 and end > 0 is INVALID.
-            start > 0 and end <= 0 is INVALID.
-            start > end is INVALID.
-            A range outside the current file is INVALID.
-            A ranged write to a nonexistent file is INVALID.
-            Invalid requests return a failure result instead of guessing.
-
-            content="" with a valid positive range DELETES those lines.
-
-        Reuse known line numbers when unchanged. Read only the affected range
-        if edits or external changes made those coordinates uncertain. Use
-        edit() instead when exact old text is already known.
+        Line numbers come from read output. If an edit or external change
+        made them uncertain, re-read only the affected range -- not the file.
         """
         try:
             target = files.resolve(path)
@@ -1799,12 +1752,21 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
     def edit(
         path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> str:
-        """Replace an exact string in a file.
+        """Replace exact text in a file. The preferred way to change existing files.
 
-        `old_string` must match the file exactly, including whitespace and
-        indentation -- copy it verbatim from a `read`. It must match exactly
-        once unless `replace_all` is set. Prefer one larger replacement of a
-        coherent block over several small interleaved ones.
+        old_string must match the file EXACTLY, including whitespace,
+        indentation, and newlines -- copy it verbatim from read output. It
+        must match exactly once unless replace_all=true.
+
+        A failed match is cheap: the error names the closest matching lines,
+        so fix old_string and retry instead of re-reading the whole file.
+
+        RULES:
+            - Prefer one larger edit of a coherent block over several small
+              interleaved ones.
+            - Keep old_string as small as possible while still unique.
+            - To create a file use write; old_string must not be empty.
+            - The file's line endings (CRLF or LF) are preserved.
         """
         target = files.resolve(path)
         print(f"\n[edit {target}]", file=sys.stderr, flush=True)
@@ -1851,7 +1813,6 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
 
     return [
         Tool(read, takes_ctx=False, name="read", sequential=True, strict=False),
-        Tool(read_image, takes_ctx=False, name="read_image", sequential=True, strict=False),
         Tool(write, takes_ctx=False, name="write", sequential=True, strict=False),
         Tool(edit, takes_ctx=False, name="edit", sequential=True, strict=False),
     ]
@@ -2142,12 +2103,12 @@ def build_system_prompt(
         batching several into one response buys nothing and costs you the
         chance to react to what each one returned.
 
-        Use `read`, `write`, and `edit` for files. `edit` replaces an exact,
-        unique string: copy `old_string` verbatim out of a `read`, including
-        its indentation. Use `write` for a new file or a deliberate full
-        rewrite. Prefer one larger `edit` of a coherent block over several
-        small interleaved ones. Use `read_image` to look at a JPG or PNG
-        image; the picture itself becomes part of the conversation.
+        Use `read`, `write`, and `edit` for files. `read` also returns JPG
+        and PNG images as visual attachments, so looking at a picture is
+        just reading it. `edit` replaces an exact, unique string: copy
+        `old_string` verbatim out of a `read`, including its indentation.
+        Use `write` for a new file or a deliberate full rewrite. Prefer one
+        larger `edit` of a coherent block over several small interleaved ones.
 
         `{kind}` starts in the selected workspace. Use it for everything
         else: running commands, searching, and verifying results. Project

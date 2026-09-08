@@ -40,65 +40,25 @@ def test_write_returns_a_failure_result_for_invalid_range(tmp_path: Path) -> Non
     assert target.read_text(encoding="utf-8") == "first\nsecond\n"
 
 
-def test_unsupported_image_input_strips_images_and_continues(tmp_path, monkeypatch):
-    """llama.cpp without --mmproj answers 500 'image input is not supported'.
-
-    The image sits in the history, so a reconnect-retry resubmits it forever.
-    run_turn must instead strip every image, disable read_image, and finish.
-    """
-    import asyncio
+def test_read_attaches_a_real_image(tmp_path: Path) -> None:
+    """read() on a PNG returns the bytes as a BinaryContent attachment."""
     import base64
 
-    import pm_coder
-    from pydantic_ai import Agent
-    from pydantic_ai.exceptions import ModelHTTPError
-    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
-    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.messages import BinaryContent
 
-    png = tmp_path / "shot.png"
-    png.write_bytes(base64.b64decode(
+    payload = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9Q"
         "DwADhgGAWjR9awAAAABJRU5ErkJggg=="
-    ))
-    settings = pm_coder.build_settings(cwd=tmp_path, model="test", context_window=96_000)
-    session = pm_coder.SessionStore(tmp_path / "session", tmp_path)
-    session.context_window = 96_000
-    monkeypatch.setattr(pm_coder, "active_session", session)
+    )
+    (tmp_path / "shot.png").write_bytes(payload)
+    read = _function(make_file_tools(_settings(tmp_path)), "read")
 
-    calls = 0
+    image, note = read("shot.png")
 
-    def respond(messages, info):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return ModelResponse(parts=[ToolCallPart(tool_name="read_image", args={"path": "shot.png"})])
-        if pm_coder.count_images(list(messages)):
-            raise ModelHTTPError(status_code=500, model_name="test", body={
-                "error": {
-                    "code": 500,
-                    "message": "image input is not supported - hint: if this is "
-                               "unexpected, you may need to provide the mmproj",
-                    "type": "server_error",
-                }
-            })
-        return ModelResponse(parts=[TextPart(content="done without the image")])
-
-    async def run():
-        agent = Agent(FunctionModel(respond), tools=pm_coder.make_file_tools(settings))
-        async with agent:
-            return await pm_coder.run_turn(agent, settings, session, "check shot.png")
-
-    result = asyncio.run(run())
-
-    assert result.response == "done without the image"
-    assert calls == 3
-    assert session.vision_supported is False
-    assert pm_coder.count_images(session.load_messages()) == 0
-
-    # read_image now declines instead of attaching another image the endpoint
-    # would reject again.
-    read_image = _function(make_file_tools(_settings(tmp_path)), "read_image")
-    assert "does not support image input" in read_image("shot.png")[0]
+    assert isinstance(image, BinaryContent)
+    assert image.data == payload
+    assert image.media_type == "image/png"
+    assert "image attached" in note
 
 
 def test_subagent_returns_a_failure_result_for_invalid_arguments(tmp_path: Path) -> None:
