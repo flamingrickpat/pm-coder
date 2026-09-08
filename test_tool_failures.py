@@ -109,6 +109,31 @@ def test_subagent_returns_a_failure_result_for_invalid_arguments(tmp_path: Path)
     assert "has no len" in result["error"]
 
 
+def test_file_tools_run_identically_against_a_bash_machine(tmp_path):
+    """Same factory, same signatures, same behavior -- only storage switches."""
+    from pm_bash_machine import BashMachine
+
+    vm = BashMachine()
+    tools = make_file_tools(_settings(tmp_path), vm)
+    read = _function(tools, "read")
+    write = _function(tools, "write")
+    edit = _function(tools, "edit")
+
+    assert "whole file" in write("/home/user/notes.txt", "alpha\nbeta\ngamma\n")
+    window = read("/home/user/notes.txt", start_line=2, line_length=1)
+    assert "2: beta" in window
+
+    assert edit("/home/user/notes.txt", "beta", "BETA").startswith("edited")
+    assert vm.read_text("/home/user/notes.txt") == "alpha\nBETA\ngamma\n"
+
+    # Ranged writes work too: content="" with a valid range deletes the lines.
+    assert "lines 2-2" in write("/home/user/notes.txt", "", 2, 2)
+    assert vm.read_text("/home/user/notes.txt") == "alpha\ngamma\n"
+
+    result = _failure(read("missing.txt"))
+    assert "file does not exist" in result["error"]
+
+
 def test_plain_skill_read_includes_content_beyond_default_window(tmp_path):
     skill = tmp_path / "SKILL.md"
     skill.write_text("line\n" * 1100 + "FINAL_SKILL_RULE\n", encoding="utf-8")

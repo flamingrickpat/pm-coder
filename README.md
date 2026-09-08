@@ -66,9 +66,9 @@ Five built-in tools, plus whatever the MCP servers contribute:
 
 | Tool | Signature | Notes |
 | --- | --- | --- |
-| `read` | `read(path, offset=1, limit=0)` | Line numbers are prepended for reference. `limit=0` reads the whole file. |
+| `read` | `read(path, start_line=1, line_length=…, start_column=1, column_length=…)` | Bounded, line-numbered window; the defaults and hard cap scale with the model's context size. Pass `0` everywhere for a full read. |
 | `read_image` | `read_image(path)` | Attaches a JPG or PNG to the conversation as a base64 image, so a vision-capable model can see it. |
-| `write` | `write(path, content)` | Creates a file or fully rewrites one. Always UTF-8, no BOM. |
+| `write` | `write(path, content, start=0, end=0)` | Whole file by default; a positive inclusive `start`–`end` range replaces (or with empty content, deletes) those lines. Always UTF-8, no BOM. |
 | `edit` | `edit(path, old_string, new_string, replace_all=False)` | Exact string match, must be unique unless `replace_all`. |
 | `powershell` / `bash` | `(command, timeout_seconds)` | Everything else: running, searching, verifying. Named after the selected backend. |
 
@@ -287,6 +287,9 @@ print(result.stdout)
 ```
 
 The virtual filesystem stays available for the lifetime of the `BashMachine` object.
+Agents running on a machine get the same `read`/`read_image`/`write`/`edit`
+tools with the same signatures as on the real filesystem -- `make_file_tools`
+simply switches its storage backend to the machine.
 
 The current directory and exported environment variables also persist for each user.
 

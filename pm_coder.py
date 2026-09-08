@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import difflib
+import io
 import itertools
 import json
 import os
@@ -211,7 +212,6 @@ __all__ = [
     "make_file_tools",
     "make_shell_tool",
     "make_subagent_tool",
-    "make_virtual_file_tools",
     "open_bash_machine_session",
     "open_session",
     "probe_endpoint",
@@ -1129,16 +1129,6 @@ def resolve_path(settings: Settings, path: str) -> Path:
     return candidate
 
 
-def read_file_text(path: Path) -> str:
-    """Decode a file without universal-newline translation.
-
-    ``Path.read_text`` rewrites CRLF to LF in memory, which would hide a
-    file's real line endings from :func:`newline_style` and silently convert
-    every edited file to LF.
-    """
-    return path.read_bytes().decode("utf-8", errors="replace")
-
-
 def newline_style(text: str) -> str:
     """The line ending a file already uses, so editing it does not convert it."""
     return "\r\n" if "\r\n" in text else "\n"
@@ -1528,38 +1518,88 @@ IMAGE_MEDIA_TYPES = {
 }
 
 
-def _edit_text(
-    text: str, old_string: str, new_string: str, replace_all: bool
-) -> tuple[str | None, str]:
-    """Apply an exact string replacement in memory.
+# ---------------------------------------------------------------------------
+# File backends
+#
+# read / write / edit are implemented once, below. The only difference
+# between the real workspace and an in-memory BashMachine is how bytes get
+# on and off a disk, so exactly that syscall-shaped part sits behind this
+# small interface and everything above it -- bounded reads, ranged writes,
+# exact-text edits, failure results -- is shared verbatim.
+# ---------------------------------------------------------------------------
 
-    Returns (updated_text, message). updated_text is None on failure.
+
+@dataclass(frozen=True)
+class HostFiles:
+    """File operations against the real workspace under ``settings.cwd``."""
+
+    settings: Settings
+
+    def resolve(self, path: str) -> str:
+        return str(resolve_path(self.settings, path))
+
+    def is_file(self, target: str) -> bool:
+        return Path(target).is_file()
+
+    def size(self, target: str) -> int:
+        return Path(target).stat().st_size
+
+    def read_bytes(self, target: str) -> bytes:
+        # Bytes, not read_text: universal-newline translation would hide a
+        # file's real line endings from newline_style and silently convert
+        # every edited CRLF file to LF.
+        return Path(target).read_bytes()
+
+    def write_bytes(self, target: str, data: bytes) -> None:
+        atomic_write_bytes(Path(target), data)
+
+    def open_text(self, target: str):
+        return open(target, "r", encoding="utf-8", errors="replace", newline=None)
+
+
+@dataclass(frozen=True)
+class VirtualFiles:
+    """The same operations routed into an in-memory BashMachine."""
+
+    bash_machine: Any
+
+    def resolve(self, path: str) -> str:
+        # Virtual paths stay as given; relative ones resolve against the
+        # machine's admin cwd (``/home/user``), like its shell commands do.
+        return path
+
+    def is_file(self, target: str) -> bool:
+        return self.bash_machine.is_file(target)
+
+    def size(self, target: str) -> int:
+        return len(self.read_bytes(target))
+
+    def read_bytes(self, target: str) -> bytes:
+        return self.bash_machine.read_binary(target)
+
+    def write_bytes(self, target: str, data: bytes) -> None:
+        # The file tools only ever write UTF-8 text; storing it as text keeps
+        # BashMachine.read_text and shell `cat` working on tool-written files.
+        self.bash_machine.write_text(target, data.decode("utf-8"))
+
+    def open_text(self, target: str):
+        # The machine already holds the file in memory; the bounded reader
+        # streams over a StringIO with the same newline translation the host
+        # backend gets from newline=None.
+        text = self.read_bytes(target).decode("utf-8", errors="replace")
+        return io.StringIO(text.replace("\r\n", "\n").replace("\r", "\n"))
+
+
+def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[Any]]:
+    """Build read/read_image/write/edit against one storage backend.
+
+    With ``bash_machine=None`` the tools operate on the real workspace under
+    ``settings.cwd``. With a BashMachine they operate on its in-memory
+    filesystem. Signatures and behavior are identical; only the file
+    operations behind the tools switch.
     """
-    old = old_string.replace("\r\n", "\n")
-    new = new_string.replace("\r\n", "\n")
-    if not old:
-        return None, "error: old_string is empty; use write to create a file"
-    count = text.count(old)
-    if count == 0:
-        return (
-            None,
-            "error: no match for old_string. It must match the "
-            "file exactly, including whitespace and indentation."
-            + match_hint(text, old),
-        )
-    if count > 1 and not replace_all:
-        return (
-            None,
-            f"error: found {count} matches for old_string. Add "
-            "surrounding context to make it unique, or pass replace_all=true.",
-        )
-    line = text[: text.index(old)].count("\n") + 1
-    updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
-    where = f"{count} occurrences" if replace_all else f"line {line}"
-    return updated, f"edited ({where}, file is now {len(split_lines(updated))} lines)"
+    files = VirtualFiles(bash_machine) if bash_machine is not None else HostFiles(settings)
 
-
-def make_file_tools(settings: Settings) -> list[Tool[Any]]:
     def read(
             path: str,
             start_line: int = 1,
@@ -1589,20 +1629,14 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
             Default: {read_columns}. Pass <= 0 for this default.
             A positive value overrides that default.
 
-        NORMAL READ:
-            read("src/foo.py", 0, 0, 0, 0)
-
         READ 100 LINES STARTING AT LINE 500:
             read("src/foo.py", 500, 100, 0, 0)
 
         READ THE NEXT 4000 CHARACTERS OF A HUGE ONE-LINE FILE:
             read("bundle.min.js", 1, 1, 4001, 4000)
 
-        SKILL FILES: if any part of the path contains "skill" (case-insensitive,
-        e.g. skills/item-implementer-auto/SKILL.md), a plain read(path) returns
-        the WHOLE file regardless of the numeric defaults. Pass explicit
-        coordinates only if you deliberately want a slice of it. A skill larger
-        than the hard output limit falls back to bounded reading and says so.
+        DANGEROUS FULL READ (use this only for files you know won't overflow the context quickly) :
+            read("src/foo.py", 0, 0, 0, 0)
 
         Long physical lines are never loaded whole. They are scanned in chunks.
 
@@ -1611,14 +1645,14 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         follow the continuation coordinates printed by the tool when that happens.
         """
         try:
-            target = resolve_path(settings, path)
+            target = files.resolve(path)
             print(
                 f"\n[read {target} start_line={start_line} line_length={line_length} "
                 f"start_column={start_column} column_length={column_length}]",
                 file=sys.stderr,
                 flush=True,
             )
-            if not target.is_file():
+            if not files.is_file(target):
                 raise FileNotFoundError(f"file does not exist: {target}")
 
             if (
@@ -1631,16 +1665,11 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
                 line_length = sys.maxsize
                 column_length = sys.maxsize
 
-            with target.open(
-                "r",
-                encoding="utf-8",
-                errors="replace",
-                newline=None,
-            ) as handle:
+            with files.open_text(target) as handle:
                 return _bounded_read_stream(
                     handle,
                     str(target),
-                    target.stat().st_size,
+                    files.size(target),
                     start_line,
                     line_length,
                     start_column,
@@ -1655,7 +1684,7 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         model receives both as visual input. Use this for screenshots,
         diagrams, or any picture the task refers to.
         """
-        target = resolve_path(settings, path)
+        target = files.resolve(path)
         print(f"\n[read_image {target}]", file=sys.stderr, flush=True)
         if not active_session.vision_supported:
             return [
@@ -1663,15 +1692,19 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
                 "was started without a projector, e.g. llama.cpp --mmproj); "
                 "work from text evidence instead"
             ]
-        if not target.is_file():
+        if not files.is_file(target):
             return [f"error: file does not exist: {target}"]
-        media_type = IMAGE_MEDIA_TYPES.get(target.suffix.lower())
+        suffix = Path(str(target)).suffix.lower()
+        media_type = IMAGE_MEDIA_TYPES.get(suffix)
         if media_type is None:
             return [
-                f"error: unsupported image type {target.suffix or '(none)'} in "
+                f"error: unsupported image type {suffix or '(none)'} in "
                 f"{target}; use .jpg, .jpeg, or .png"
             ]
-        data = target.read_bytes()
+        try:
+            data = files.read_bytes(target)
+        except Exception as exc:
+            return [f"error: cannot read {target}: {exc}"]
         if not data:
             return [f"error: file is empty: {target}"]
         return [
@@ -1722,7 +1755,7 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         edit() instead when exact old text is already known.
         """
         try:
-            target = resolve_path(settings, path)
+            target = files.resolve(path)
             print(
                 f"\n[write {target} start={start} end={end}]",
                 file=sys.stderr,
@@ -1730,12 +1763,16 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
             )
             whole_file = start <= 0 and end <= 0
 
-            if not whole_file and not target.is_file():
+            if not whole_file and not files.is_file(target):
                 raise FileNotFoundError(
                     f"cannot perform ranged write: file does not exist: {target}"
                 )
 
-            raw = read_file_text(target) if target.is_file() else ""
+            raw = (
+                files.read_bytes(target).decode("utf-8", errors="replace")
+                if files.is_file(target)
+                else ""
+            )
 
             updated = _replace_line_block(
                 raw,
@@ -1744,7 +1781,7 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
                 end,
             )
 
-            atomic_write_bytes(target, updated.encode("utf-8"))
+            files.write_bytes(target, updated.encode("utf-8"))
         except Exception as exc:
             return tool_failure(exc)
 
@@ -1759,20 +1796,6 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
             f"file is now {len(split_lines(updated))} lines)"
         )
 
-    # These must be ordinary docstrings for the tool schema. Substitute the
-    # limits after definition because an f-string would not be a docstring.
-    assert read.__doc__ is not None
-    read.__doc__ = (
-        read.__doc__
-        .replace("{read_lines}", str(context_limits().read_lines))
-        .replace("{read_columns}", str(context_limits().read_columns))
-    )
-    assert write.__doc__ is not None
-    write.__doc__ = (
-        write.__doc__
-        .replace("{write_chunk_chars}", str(context_limits().write_chunk_chars))
-    )
-
     def edit(
         path: str, old_string: str, new_string: str, replace_all: bool = False
     ) -> str:
@@ -1783,11 +1806,11 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         once unless `replace_all` is set. Prefer one larger replacement of a
         coherent block over several small interleaved ones.
         """
-        target = resolve_path(settings, path)
+        target = files.resolve(path)
         print(f"\n[edit {target}]", file=sys.stderr, flush=True)
-        if not target.is_file():
+        if not files.is_file(target):
             return f"error: file does not exist: {target}"
-        raw = read_file_text(target)
+        raw = files.read_bytes(target).decode("utf-8", errors="replace")
         newline = newline_style(raw)
         text = raw.replace("\r\n", "\n")
         old = old_string.replace("\r\n", "\n")
@@ -1808,98 +1831,23 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
             )
         line = text[: text.index(old)].count("\n") + 1
         updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
-        atomic_write_bytes(target, updated.replace("\n", newline).encode("utf-8"))
+        files.write_bytes(target, updated.replace("\n", newline).encode("utf-8"))
         where = f"{count} occurrences" if replace_all else f"line {line}"
         return f"edited {target} ({where}, file is now {len(split_lines(updated))} lines)"
 
-    return [
-        Tool(read, takes_ctx=False, name="read", sequential=True, strict=False),
-        Tool(read_image, takes_ctx=False, name="read_image", sequential=True, strict=False),
-        Tool(write, takes_ctx=False, name="write", sequential=True, strict=False),
-        Tool(edit, takes_ctx=False, name="edit", sequential=True, strict=False),
-    ]
-
-
-def make_virtual_file_tools(bash_machine: Any) -> list[Tool[Any]]:
-    """File tools that read and write in an in-memory BashMachine.
-
-    Paths are virtual, e.g. ``/home/user/notes.txt`` or relative paths.
-    Relative paths resolve against the admin shell's cwd (``/home/user``).
-    """
-
-    def read(path: str, offset: int = 1, limit: int = 0) -> str:
-        print(
-            f"\n[read :{path} offset={offset} limit={limit}]",
-            file=sys.stderr,
-            flush=True,
-        )
-        try:
-            raw = bash_machine.read_text(path)
-        except Exception as exc:
-            return f"error: cannot read {path}: {exc}"
-        lines = split_lines(raw)
-        start = max(1, offset)
-        end = len(lines) if limit <= 0 else min(len(lines), start + limit - 1)
-        header = f"{path} ({len(lines)} lines)"
-        if start > 1 or end < len(lines):
-            header += f", showing lines {start}-{end}"
-        body = "\n".join(
-            f"{number}: {lines[number - 1]}" for number in range(start, end + 1)
-        )
-        return f"{header}\n{body}"
-
-    def read_image(path: str):
-        print(f"\n[read_image :{path}]", file=sys.stderr, flush=True)
-        if not active_session.vision_supported:
-            return [
-                "error: this endpoint does not support image input (the server "
-                "was started without a projector, e.g. llama.cpp --mmproj); "
-                "work from text evidence instead"
-            ]
-        try:
-            data = bash_machine.read_binary(path)
-        except Exception as exc:
-            return [f"error: cannot read {path}: {exc}"]
-        suffix = Path(path).suffix.lower()
-        media_type = IMAGE_MEDIA_TYPES.get(suffix)
-        if media_type is None:
-            return [
-                f"error: unsupported image type {suffix or '(none)'} in "
-                f"{path}; use .jpg, .jpeg, or .png"
-            ]
-        if not data:
-            return [f"error: file is empty: {path}"]
-        return [
-            BinaryContent(data, media_type=media_type),
-            f"image attached: {path} ({len(data):,} bytes)",
-        ]
-
-    def write(path: str, content: str) -> str:
-        body = content.replace("\r\n", "\n")
-        try:
-            bash_machine.write_text(path, body)
-        except Exception as exc:
-            return f"error: cannot write {path}: {exc}"
-        print(f"\n[write {path}]", file=sys.stderr, flush=True)
-        return f"created/overwrote {path} ({len(split_lines(body))} lines)"
-
-    def edit(
-        path: str, old_string: str, new_string: str, replace_all: bool = False
-    ) -> str:
-        print(f"\n[edit :{path}]", file=sys.stderr, flush=True)
-        try:
-            raw = bash_machine.read_text(path)
-        except Exception as exc:
-            return f"error: cannot read {path}: {exc}"
-        text = raw.replace("\r\n", "\n")
-        updated, message = _edit_text(text, old_string, new_string, replace_all)
-        if updated is None:
-            return message
-        try:
-            bash_machine.write_text(path, updated)
-        except Exception as exc:
-            return f"error: cannot write {path}: {exc}"
-        return f"edited {path} ({message})"
+    # These must be ordinary docstrings for the tool schema. Substitute the
+    # limits after definition because an f-string would not be a docstring.
+    assert read.__doc__ is not None
+    read.__doc__ = (
+        read.__doc__
+        .replace("{read_lines}", str(context_limits().read_lines))
+        .replace("{read_columns}", str(context_limits().read_columns))
+    )
+    assert write.__doc__ is not None
+    write.__doc__ = (
+        write.__doc__
+        .replace("{write_chunk_chars}", str(context_limits().write_chunk_chars))
+    )
 
     return [
         Tool(read, takes_ctx=False, name="read", sequential=True, strict=False),
@@ -2609,11 +2557,7 @@ def build_agent(
         if bash_machine is not None
         else make_shell_tool(settings)
     )
-    file_tools = (
-        make_virtual_file_tools(bash_machine)
-        if bash_machine is not None
-        else make_file_tools(settings)
-    )
+    file_tools = make_file_tools(settings, bash_machine)
     system_prompt = build_system_prompt(
         settings,
         discovery,

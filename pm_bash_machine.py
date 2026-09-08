@@ -482,6 +482,12 @@ class BashMachine:
                 raise RuntimeError(result.stderr)
             return base64.b64decode(result.stdout)
 
+    def is_file(self, path: str) -> bool:
+        """True for an existing regular file, bypassing user ACLs."""
+        with self._lock:
+            result = self._admin.run(f"test -f {shlex.quote(path)}")
+            return result.exit_code == 0
+
     def load_text(
         self,
         real_path: str | os.PathLike[str],

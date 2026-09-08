@@ -287,6 +287,14 @@ def test_lazy_binary_obeys_acl(vm):
     assert source.calls == 0
 
 
+def test_is_file(vm):
+    vm.write_text("/home/user/file.txt", "hello")
+
+    assert vm.is_file("/home/user/file.txt")
+    assert not vm.is_file("/home/user/missing.txt")
+    assert not vm.is_file("/home/user")
+
+
 def test_host_read_bypasses_acl(vm):
     vm.write_text(
         "/home/user/secret.txt",
