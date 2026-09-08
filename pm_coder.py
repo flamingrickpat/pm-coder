@@ -173,6 +173,7 @@ SNAPSHOT_SECONDS = 30.0
 IMAGE_HIGH_WATER = 32
 IMAGE_LOW_WATER = 8
 OMITTED = "[older image omitted]"
+VISION_REMOVED = "[image removed: this endpoint does not support image input]"
 
 MCP_CONFIG_CANDIDATES = (
     ".mcp.json",
@@ -317,8 +318,10 @@ def count_images(messages: list[ModelMessage]) -> int:
     return total
 
 
-def _omit_older_images(messages: list[ModelMessage], keep: int) -> list[ModelMessage]:
-    """Swap every image but the newest ``keep`` for an OMITTED placeholder."""
+def _omit_older_images(
+    messages: list[ModelMessage], keep: int, placeholder: str = OMITTED
+) -> list[ModelMessage]:
+    """Swap every image but the newest ``keep`` for a placeholder."""
 
     kept = 0
 
@@ -330,7 +333,7 @@ def _omit_older_images(messages: list[ModelMessage], keep: int) -> list[ModelMes
             if kept < keep:
                 kept += 1
                 return x
-            return OMITTED
+            return placeholder
 
         # Tool returns can contain arbitrarily nested multimodal data.
         if isinstance(x, Mapping):
@@ -446,6 +449,10 @@ class SessionStore:
         # Text the next model request gets as a fake user turn: a loop alert
         # or the compaction stats view. Cleared once injected.
         self.pending_alert: str | None = None
+        # Set False the first time the endpoint rejects an image; read_image
+        # then answers with text instead of attaching one the endpoint will
+        # keep rejecting.
+        self.vision_supported = True
 
     def record_tool_call(self, name: str, tool_args: dict[str, Any]) -> None:
         """Count one normalized tool call, and flag a loop when it repeats."""
@@ -1650,6 +1657,12 @@ def make_file_tools(settings: Settings) -> list[Tool[Any]]:
         """
         target = resolve_path(settings, path)
         print(f"\n[read_image {target}]", file=sys.stderr, flush=True)
+        if not active_session.vision_supported:
+            return [
+                "error: this endpoint does not support image input (the server "
+                "was started without a projector, e.g. llama.cpp --mmproj); "
+                "work from text evidence instead"
+            ]
         if not target.is_file():
             return [f"error: file does not exist: {target}"]
         media_type = IMAGE_MEDIA_TYPES.get(target.suffix.lower())
@@ -1837,6 +1850,12 @@ def make_virtual_file_tools(bash_machine: Any) -> list[Tool[Any]]:
 
     def read_image(path: str):
         print(f"\n[read_image :{path}]", file=sys.stderr, flush=True)
+        if not active_session.vision_supported:
+            return [
+                "error: this endpoint does not support image input (the server "
+                "was started without a projector, e.g. llama.cpp --mmproj); "
+                "work from text evidence instead"
+            ]
         try:
             data = bash_machine.read_binary(path)
         except Exception as exc:
@@ -2746,6 +2765,11 @@ CONTEXT_MARKERS = (
 # 545 tokens, because the forced path skips the size check.
 GENERATION_FAILURE_MARKERS = ("failed to parse", "as json",)
 
+# The endpoint rejecting what *we* attached: llama.cpp without --mmproj
+# answers 500 "image input is not supported". The image sits in the history,
+# so the plain reconnect-and-retry path resubmits it forever.
+UNSUPPORTED_INPUT_MARKERS = ("image input is not supported", "mmproj",)
+
 
 def error_text(exc: BaseException) -> str:
     """Flattened message plus response body, folded, for marker matching."""
@@ -2770,6 +2794,11 @@ def is_context_failure(exc: BaseException) -> bool:
 def is_generation_failure(exc: BaseException) -> bool:
     """True when the model's own output was unusable, whatever the room left."""
     return any(marker in error_text(exc) for marker in GENERATION_FAILURE_MARKERS)
+
+
+def is_unsupported_input(exc: BaseException) -> bool:
+    """True when the endpoint rejects a capability the request uses (vision)."""
+    return any(marker in error_text(exc) for marker in UNSUPPORTED_INPUT_MARKERS)
 
 
 # pydantic-ai feeds a tool's validation error back to the model as a retry
@@ -3410,6 +3439,8 @@ async def run_turn(
                 next_prompt = await recover(
                     f"out of room ({type(exc).__name__})",
                 )
+            elif is_unsupported_input(exc):
+                raise Exception(f"{type(exc).__name__}: endpoint has no image/mtmd support!")
             else:
                 # reconnect. The exception may have struck between the model
                 # emitting a tool call and that call's result landing;
