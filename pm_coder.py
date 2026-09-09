@@ -2982,6 +2982,7 @@ async def compact(
     # Summarize the whole task, including previous checkpoints and any partial
     # final response, before dropping an unanswered tool call from the tail.
     summary = await summarize(settings, history)
+    cnt = 0
     while len(summary) > context_limits().compact_summary_chars:
         summary = await summarize_text(
             settings,
@@ -2989,6 +2990,9 @@ async def compact(
             f"{context_limits().compact_summary_chars} characters. Preserve requirements and "
             "current task state; replace file contents with paths.\n\n" + summary,
         )
+        cnt += 1
+        if cnt > 2:
+            break
     tail = compaction_tail(drop_unanswered_tail(history), recoveries)
     checkpoint = checkpoint_part(summary, stream_path)
     if tail:
