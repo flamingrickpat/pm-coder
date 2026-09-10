@@ -646,6 +646,7 @@ class Settings(BaseModel):
     skill: str | None
     verbose: bool
     context_window: int = Field(gt=0)
+    enable_write: bool
 
 
 def probe_endpoint(
@@ -696,6 +697,7 @@ def build_settings(
     skill: str | None = None,
     verbose: bool = False,
     context_window: int = DEFAULT_CONTEXT_WINDOW,
+    enable_write: bool
 ) -> Settings:
     """Resolve one runtime configuration, probing the endpoint if needed.
 
@@ -739,6 +741,7 @@ def build_settings(
         skill=skill,
         verbose=verbose,
         context_window=context_window,
+        enable_write=enable_write
     )
 
 
@@ -811,6 +814,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print the raw model stream to stderr as it arrives.",
     )
+    parser.add_argument("--enable-write",dest="enable_write", action="store_true", default=True,
+                        help="Enable tools with write access to FS.")
+    parser.add_argument("--disable-write", dest="enable_write", action="store_false",
+                        help="Disable tools with write access to FS.")
+
     return parser.parse_args(argv)
 
 
@@ -827,6 +835,7 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
         skill=args.skill,
         verbose=args.verbose,
         context_window=args.context_window,
+        enable_write=args.enable_write
     )
 
 
@@ -1811,11 +1820,14 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
         .replace("{write_chunk_chars}", str(context_limits().write_chunk_chars))
     )
 
-    return [
-        Tool(read, takes_ctx=False, name="read", sequential=True, strict=False),
-        Tool(write, takes_ctx=False, name="write", sequential=True, strict=False),
-        Tool(edit, takes_ctx=False, name="edit", sequential=True, strict=False),
-    ]
+    if settings.enable_write:
+        return [
+            Tool(read, takes_ctx=False, name="read", sequential=True, strict=False),
+            Tool(write, takes_ctx=False, name="write", sequential=True, strict=False),
+            Tool(edit, takes_ctx=False, name="edit", sequential=True, strict=False),
+        ]
+    else:
+        return [Tool(read, takes_ctx=False, name="read", sequential=True, strict=False)]
 
 
 # ---------------------------------------------------------------------------
@@ -2086,6 +2098,16 @@ def build_system_prompt(
         progress, verify every claimed effect, and leave durable evidence when
         useful. Conversation history may continue across requests, so use it as
         context without repeating completed work.
+
+        Write-access to file-system is {'ENABLED' if settings.enable_write else 'DISABLED'} for this session and all
+        subagent sessions. Write-access is implemented by edit, write and host_shell.
+        When write-access is DISABLED, you and your subagents cannot create,
+        edit, delete, rename, or otherwise modify files. If the user's request
+        requires any such change, do not call tools or delegate the task in an
+        attempt to find a workaround. Immediately report that the request cannot
+        be completed because write-access is disabled, and tell the user to
+        restart without --disable-write. You may still use read-only tools for
+        requests that can be completed without modifying files.
 
         Conserve tokens. Reuse file contents, discovered facts, and check results
         already present in your context or checkpoint. Do not repeat repository
@@ -2513,12 +2535,18 @@ def build_agent(
     with_subagent_tool: bool = False,
     capture_stream: bool = False,
 ) -> Agent[Any, str]:
+    sys_tools = []
     shell_tool = (
         make_bash_machine_tool(bash_machine, bash_machine_user)
         if bash_machine is not None
         else make_shell_tool(settings)
     )
+    if settings.enable_write:
+        sys_tools.append(shell_tool)
+
     file_tools = make_file_tools(settings, bash_machine)
+    sys_tools += file_tools
+
     system_prompt = build_system_prompt(
         settings,
         discovery,
@@ -2529,8 +2557,9 @@ def build_agent(
             else None
         ),
     )
+
     own_tools = FunctionToolset(
-        tools=[shell_tool, *file_tools]
+        tools=sys_tools
         + (
             [
                 make_subagent_tool(
@@ -3023,6 +3052,11 @@ context is full, you stop. Read only the files you need. Report your
 final answer before your context is full. Your final message goes back
 to the parent agent, so make it complete and specific: name files,
 results, and anything the parent must know.
+Honor the write-access setting in the main system prompt. If write-access
+is DISABLED and this task requires a filesystem change, do not call tools or
+search for a workaround. Immediately report that you could not complete the
+task because write-access is disabled and that the user must restart without
+--disable-write.
 </subagent>
 """
 
@@ -3419,6 +3453,7 @@ def print_startup(
         f"  verbose:        {'on' if settings.verbose else 'off'}",
         f"  run id:         {session.run_id}",
         f"  session dir:    {session.path}",
+        f"  enable write:   {settings.enable_write}",
     ]
     lines += [f"  skill warning:  {error}" for error in discovery.skill_errors]
     print("\n".join(lines), file=sys.stderr, flush=True)

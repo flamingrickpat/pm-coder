@@ -1341,7 +1341,7 @@ wheels = [
 
 [[package]]
 name = "pm-coder"
-version = "0.5.7"
+version = "0.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "just-bash" },
