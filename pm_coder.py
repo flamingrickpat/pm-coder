@@ -697,7 +697,7 @@ def build_settings(
     skill: str | None = None,
     verbose: bool = False,
     context_window: int = DEFAULT_CONTEXT_WINDOW,
-    enable_write: bool
+    enable_write: bool = True
 ) -> Settings:
     """Resolve one runtime configuration, probing the endpoint if needed.
 
