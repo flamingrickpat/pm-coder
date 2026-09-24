@@ -368,7 +368,7 @@ class BashMachine:
             )
             self._users[name] = _User(bash=bash, cwd=cwd)
 
-    def exec(self, user: str, command: str) -> BashResult:
+    def exec(self, user: str, command: str, *, strip_output: bool = True) -> BashResult:
         """
         Execute one blocking shell call as one virtual user.
 
@@ -419,7 +419,7 @@ class BashMachine:
                 stdout = visible + after
 
             return BashResult(
-                stdout=stdout.strip(),
+                stdout=stdout.strip() if strip_output else stdout,
                 stderr=result.stderr,
                 exit_code=result.exit_code,
             )
@@ -433,6 +433,27 @@ class BashMachine:
     ) -> None:
         """Add text without copying a large provider-backed value."""
         self._write_virtual(path, content, binary=False, access=access)
+
+    def write_texts(
+        self, files: Mapping[str, Any], *, access: AccessSpec = Access.RW,
+    ) -> None:
+        """Register a batch of lazy text files with one filesystem operation."""
+        if not files:
+            return
+        with self._lock:
+            normalized = {_path(path): content for path, content in files.items()}
+            parents = sorted({posixpath.dirname(path) or "/" for path in normalized})
+            # Each Bash.run creates an asyncio loop. Batch large memory projections
+            # to avoid thousands of Windows socket pairs during registration.
+            result = self._admin.run(
+                "mkdir -p -- " + " ".join(map(shlex.quote, parents))
+                + " && touch -- " + " ".join(map(shlex.quote, normalized))
+            )
+            if result.exit_code != 0:
+                raise RuntimeError(result.stderr)
+            for path, content in normalized.items():
+                self._content[path] = _Content(content, binary=False)
+                self._acl[path] = access
 
     def write_binary(
         self,

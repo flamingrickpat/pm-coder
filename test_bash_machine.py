@@ -49,6 +49,19 @@ def vm():
     return machine
 
 
+def test_batch_text_files_are_lazy_discoverable_and_protected(vm):
+    lazy = LazyText("  memory text\n\n")
+    vm.write_texts({"/shared/a file.txt": lazy, "/shared/sub/b.txt": "second"}, access=Access.R)
+    assert lazy.calls == 0
+    listing = vm.exec("user", "find /shared -type f").check().stdout
+    assert "/shared/a file.txt" in listing
+    assert "/shared/sub/b.txt" in listing
+    assert vm.exec("user", "cat '/shared/a file.txt'", strip_output=False).check().stdout == "  memory text\n\n"
+    assert lazy.calls == 1
+    assert vm.exec("user", "echo changed > '/shared/a file.txt'").exit_code != 0
+    assert vm.exec("user", "cat '/shared/a file.txt'").check().stdout == "memory text"
+
+
 def test_default_file_is_read_write(vm):
     vm.write_text("/home/user/file.txt", "hello")
 
