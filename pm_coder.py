@@ -154,9 +154,9 @@ CONTEXT_LIMITS = {
 }
 
 
-def context_limits() -> ContextLimits:
-    size = active_session.context_window
-    tier = max(minimum for minimum in CONTEXT_LIMITS if size >= minimum)
+def context_limits(size: int = 96_000) -> ContextLimits:
+    """Select tool budgets from an explicit context size, never another session."""
+    tier = max((minimum for minimum in CONTEXT_LIMITS if size >= minimum), default=min(CONTEXT_LIMITS))
     return CONTEXT_LIMITS[tier]
 
 
@@ -490,11 +490,7 @@ class SessionStore:
             stamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
             cwd_id = re.sub(r"[^A-Za-z0-9._-]+", "_", str(cwd.resolve())).strip("_")
             base_name = f"{stamp}_{cwd_id or 'workspace'}"
-            path = root / base_name
-            suffix = 2
-            while path.exists():
-                path = root / f"{base_name}-{suffix}"
-                suffix += 1
+            path = Path(tempfile.mkdtemp(prefix=base_name + "-", dir=root))
         else:
             if Path(run_id).name != run_id or run_id in {".", ".."}:
                 raise ValueError("run_id must be a single safe directory name")
@@ -570,17 +566,13 @@ class SessionStore:
             handle.write("\n")
 
 
-# The HTTP logger below sits under Pydantic AI's message layer and has no
-# route to the active session, so the store is published here at open time.
-active_session: SessionStore | None = None
-
 @dataclass(init=False)
 class LoggingOpenAIChatModel(OpenAIChatModel):
     """OpenAIChatModel that dumps every /chat/completions body to the session.
 
-    Logging happens below Pydantic AI's message and tool conversion, so the
-    files are exactly what the endpoint received: the raw bytes plus an
-    indented copy. Nothing here may break inference.
+    Logging happens below Pydantic AI's message and tool conversion.
+    Each file contains one indented JSON request body in the supplied store.
+    A logging error reports its cause without stopping inference.
     """
 
     def __init__(
@@ -590,11 +582,15 @@ class LoggingOpenAIChatModel(OpenAIChatModel):
         provider: OpenAIChatCompatibleProvider | Provider[AsyncOpenAI],
         profile: ModelProfileSpec | None = None,
         settings: ModelSettings | None = None,
+        session: SessionStore | None = None,
+        label: str = "agent",
     ):
         super().__init__(
             model_name, provider=provider, profile=profile, settings=settings
         )
         self._log_counter = itertools.count(1)
+        self._session = session
+        self._label = label
         # The only private API involved: AsyncOpenAI's underlying HTTP client.
         hooks = self.client._client.event_hooks
         hooks.setdefault("request", [])
@@ -605,7 +601,7 @@ class LoggingOpenAIChatModel(OpenAIChatModel):
             return
         if not request.url.path.rstrip("/").endswith("/chat/completions"):
             return
-        if active_session is None:
+        if self._session is None:
             return
 
         try:
@@ -615,12 +611,8 @@ class LoggingOpenAIChatModel(OpenAIChatModel):
 
             sequence = next(self._log_counter)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            stem = active_session.path / f"turn_{active_session.turn_id}_ac_{active_session.auto_compact_cnt}.json"
-            if stem.exists():
-                try:
-                    os.remove(stem)
-                except:
-                    stem = stem / f"{timestamp}.json"
+            session = self._session
+            stem = session.path / f"turn_{session.turn_id}_ac_{session.auto_compact_cnt}_{self._label}_{timestamp}_{sequence}.json"
             stem.write_text(dump, encoding="utf-8")
         except Exception as exc:
             note(f"prompt logger failed: {exc!r}")
@@ -941,19 +933,19 @@ def _terminate_shell_wrapper(process: subprocess.Popen[bytes]) -> bool:
     return True
 
 
-def _shell_output_preview(capture: Any, path: Path) -> str:
+def _shell_output_preview(capture: Any, path: Path, limits: ContextLimits = context_limits()) -> str:
     """Read a bounded tail without loading the complete shell output into RAM."""
     capture.seek(0, os.SEEK_END)
     size = capture.tell()
-    start = max(0, size - context_limits().shell_chars * 4)
+    start = max(0, size - limits.shell_chars * 4)
     capture.seek(start)
     text = capture.read(size - start).decode("utf-8", errors="replace")
     lines = text.splitlines(keepends=True)
-    preview = "".join(lines[-context_limits().shell_lines:])[-context_limits().shell_chars:]
+    preview = "".join(lines[-limits.shell_lines:])[-limits.shell_chars:]
     truncated = start > 0 or preview != text
     notice = (
-        f"[output truncated: showing only the tail, at most {context_limits().shell_lines} "
-        f"lines / {context_limits().shell_chars} characters]\n"
+        f"[output truncated: showing only the tail, at most {limits.shell_lines} "
+        f"lines / {limits.shell_chars} characters]\n"
         if truncated else ""
     )
     return (
@@ -968,6 +960,8 @@ def _run_host_shell(
     command: str,
     timeout_seconds: int,
     log_dir: Path | None = None,
+    *,
+    limits: ContextLimits = context_limits(),
 ) -> str:
     """Run one shell script with a timeout that cannot be held open by descendants.
 
@@ -979,7 +973,7 @@ def _run_host_shell(
     """
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero")
-    log_root = log_dir or active_session.path / "shell-output"
+    log_root = log_dir if log_dir is not None else cwd / ".pm-coder-shell-output"
     log_root.mkdir(parents=True, exist_ok=True)
     output_dir = Path(tempfile.mkdtemp(prefix="call_", dir=log_root))
     stdout_path = output_dir / "stdout.log"
@@ -1013,8 +1007,8 @@ def _run_host_shell(
                 returncode = process.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
                 terminated = _terminate_shell_wrapper(process)
-                stdout = _shell_output_preview(stdout_capture, stdout_path)
-                stderr = _shell_output_preview(stderr_capture, stderr_path)
+                stdout = _shell_output_preview(stdout_capture, stdout_path, limits)
+                stderr = _shell_output_preview(stderr_capture, stderr_path, limits)
                 detail = "" if terminated else "wrapper_terminated: false\n"
                 return (
                     "timed_out: true\n"
@@ -1024,8 +1018,8 @@ def _run_host_shell(
                     f"stderr_before_timeout:\n{stderr or '(empty)'}"
                 )
 
-            stdout = _shell_output_preview(stdout_capture, stdout_path)
-            stderr = _shell_output_preview(stderr_capture, stderr_path)
+            stdout = _shell_output_preview(stdout_capture, stdout_path, limits)
+            stderr = _shell_output_preview(stderr_capture, stderr_path, limits)
             return (
                 f"exit_code: {returncode}\n"
                 f"stdout:\n{stdout or '(empty)'}\n"
@@ -1039,8 +1033,10 @@ def _run_host_shell(
                 os.remove(script_path)
 
 
-def make_shell_tool(settings: Settings) -> Tool[Any]:
+def make_shell_tool(settings: Settings, session: SessionStore | None = None) -> Tool[Any]:
     backend = shell_backend(settings)
+    limits = context_limits(settings.context_window)
+    log_dir = session.path / "shell-output" if session is not None else settings.cwd / ".pm-coder-shell-output"
 
     def host_shell(command: str, timeout_seconds: int = settings.shell_timeout) -> str:
         """Execute a host-shell script in the selected agent workspace.
@@ -1054,7 +1050,7 @@ def make_shell_tool(settings: Settings) -> Tool[Any]:
         Prefer focused commands such as git log -5 and targeted searches.
         """
         print(f"\n[{backend.kind}]\n{command.rstrip()}", file=sys.stderr, flush=True)
-        result = _run_host_shell(backend, settings.cwd, command, timeout_seconds)
+        result = _run_host_shell(backend, settings.cwd, command, timeout_seconds, log_dir, limits=limits)
         if result.startswith("timed_out: true"):
             print(f"[{backend.kind} timed out]", file=sys.stderr, flush=True)
         else:
@@ -1063,8 +1059,8 @@ def make_shell_tool(settings: Settings) -> Tool[Any]:
         return result
 
     host_shell.__doc__ = host_shell.__doc__.replace(
-        "{shell_lines}", str(context_limits().shell_lines)
-    ).replace("{shell_chars}", str(context_limits().shell_chars))
+        "{shell_lines}", str(limits.shell_lines)
+    ).replace("{shell_chars}", str(limits.shell_chars))
 
     return Tool(
         host_shell,
@@ -1184,12 +1180,13 @@ def _resolve_read_args(
     line_length: int,
     start_column: int,
     column_length: int,
+    limits: ContextLimits = context_limits(),
 ) -> tuple[int, int, int, int]:
     return (
         1 if start_line <= 0 else start_line,
-        context_limits().read_lines if line_length <= 0 else line_length,
+        limits.read_lines if line_length <= 0 else line_length,
         1 if start_column <= 0 else start_column,
-        context_limits().read_columns if column_length <= 0 else column_length,
+        limits.read_columns if column_length <= 0 else column_length,
     )
 
 
@@ -1284,12 +1281,14 @@ def _bounded_read_stream(
     line_length: int,
     start_column: int,
     column_length: int,
+    limits: ContextLimits = context_limits(),
 ) -> str:
     start_line, line_length, start_column, column_length = _resolve_read_args(
         start_line,
         line_length,
         start_column,
         column_length,
+        limits,
     )
 
     if size == 0:
@@ -1336,7 +1335,7 @@ def _bounded_read_stream(
 
         # Keep enough reserve that headers / continuation instructions cannot
         # push the complete tool result beyond the hard output fuse.
-        remaining = context_limits().read_body_chars - used - len(prefix) - 128
+        remaining = limits.read_body_chars - used - len(prefix) - 128
 
         # Prefer stopping at a clean line boundary instead of returning seven
         # random characters from the next ordinary line.
@@ -1444,10 +1443,10 @@ def _bounded_read_stream(
         result += "\n\n" + "\n".join(notes)
 
     # This should be impossible unless somebody later breaks the accounting.
-    if len(result) > context_limits().read_output_chars:
+    if len(result) > limits.read_output_chars:
         raise RuntimeError(
             f"internal read safety invariant broken: "
-            f"{len(result)} > {context_limits().read_output_chars} characters"
+            f"{len(result)} > {limits.read_output_chars} characters"
         )
 
     return result
@@ -1601,13 +1600,14 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
     operations behind the tools switch.
     """
     files = VirtualFiles(bash_machine) if bash_machine is not None else HostFiles(settings)
+    limits = context_limits(settings.context_window)
 
     def read(
             path: str,
             start_line: int = 1,
-            line_length: int = context_limits().read_lines,
+            line_length: int = limits.read_lines,
             start_column: int = 1,
-            column_length: int = context_limits().read_columns,
+            column_length: int = limits.read_columns,
     ):
         """Read the contents of a file. Supports text files and images (jpg, png).
         Images are attached to the conversation so you can see them.
@@ -1665,9 +1665,9 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
             if (
                 "skill" in str(target).casefold()
                 and (start_line <= 0 or start_line == 1)
-                and (line_length <= 0 or line_length == context_limits().read_lines)
+                and (line_length <= 0 or line_length == limits.read_lines)
                 and (start_column <= 0 or start_column == 1)
-                and (column_length <= 0 or column_length == context_limits().read_columns)
+                and (column_length <= 0 or column_length == limits.read_columns)
             ):
                 line_length = sys.maxsize
                 column_length = sys.maxsize
@@ -1681,6 +1681,7 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
                     line_length,
                     start_column,
                     column_length,
+                    limits,
                 )
         except Exception as exc:
             return tool_failure(exc)
@@ -1811,13 +1812,13 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
     assert read.__doc__ is not None
     read.__doc__ = (
         read.__doc__
-        .replace("{read_lines}", str(context_limits().read_lines))
-        .replace("{read_columns}", str(context_limits().read_columns))
+        .replace("{read_lines}", str(limits.read_lines))
+        .replace("{read_columns}", str(limits.read_columns))
     )
     assert write.__doc__ is not None
     write.__doc__ = (
         write.__doc__
-        .replace("{write_chunk_chars}", str(context_limits().write_chunk_chars))
+        .replace("{write_chunk_chars}", str(limits.write_chunk_chars))
     )
 
     if settings.enable_write:
@@ -2473,11 +2474,16 @@ class StreamSpoolModel(WrapperModel):
 
 
 def make_model(
-    settings: Settings, label: str, stream_session: SessionStore | None = None
+    settings: Settings, label: str, stream_session: SessionStore | None = None,
+    *, session: SessionStore | None = None,
 ) -> Any:
     model: Any = LoggingOpenAIChatModel(
         settings.model,
-        provider=OpenAIProvider(base_url=settings.base_url, api_key=settings.api_key),
+        session=session if session is not None else stream_session,
+        label=label,
+        provider=OpenAIProvider(openai_client=AsyncOpenAI(
+            base_url=settings.base_url, api_key=settings.api_key, timeout=None,
+        )),
         profile=OpenAIModelProfile(
             openai_supports_strict_tool_definition=False,
             openai_chat_supports_multiple_system_messages=False,
@@ -2539,7 +2545,7 @@ def build_agent(
     shell_tool = (
         make_bash_machine_tool(bash_machine, bash_machine_user)
         if bash_machine is not None
-        else make_shell_tool(settings)
+        else make_shell_tool(settings, session)
     )
     if settings.enable_write:
         sys_tools.append(shell_tool)
@@ -2580,7 +2586,7 @@ def build_agent(
         session=session,
     )
     return Agent(
-        model=make_model(settings, "agent", session if capture_stream else None),
+        model=make_model(settings, "agent", session if capture_stream else None, session=session),
         instructions=system_prompt + extra_instructions,
         toolsets=[toolset],
         model_settings=OpenAIChatModelSettings(
@@ -2597,10 +2603,10 @@ def build_agent(
     )
 
 
-def build_summary_agent(settings: Settings) -> Agent[Any, str]:
+def build_summary_agent(settings: Settings, session: SessionStore | None = None) -> Agent[Any, str]:
     """A tool-less agent that turns conversation prefixes into checkpoints."""
     return Agent(
-        model=make_model(settings, "compact"),
+        model=make_model(settings, "compact", session=session),
         system_prompt=(
             "You summarize a coding-agent conversation into a concise, "
             "structured checkpoint that another LLM will use to continue the "
@@ -2873,14 +2879,15 @@ def serialize_for_summary(messages: list[Any]) -> str:
     return "\n\n".join(lines)
 
 
-async def summarize_text(settings: Settings, text: str) -> str:
+async def summarize_text(settings: Settings, text: str, session: SessionStore | None = None) -> str:
     """Summarize, halving the input with overlap if the summarizer itself overflows."""
+    limits = context_limits(settings.context_window)
     try:
-        agent = build_summary_agent(settings)
+        agent = build_summary_agent(settings, session)
         async with agent:
             result = await agent.run(
                 f"<conversation>\n{text}\n</conversation>\n\n" + SUMMARIZATION_PROMPT.replace(
-                    "{summary_chars}", str(context_limits().compact_summary_chars)
+                    "{summary_chars}", str(limits.compact_summary_chars)
                 ),
                 usage_limits=NO_LIMITS,
             )
@@ -2889,7 +2896,7 @@ async def summarize_text(settings: Settings, text: str) -> str:
         if not is_context_failure(exc):
             raise
         mid = len(text) // 2
-        overlap = min(context_limits().summary_overlap_chars, mid // 2)
+        overlap = min(limits.summary_overlap_chars, mid // 2)
         left = text[: mid + overlap]
         right = text[mid - overlap :]
         # If halving cannot shrink the input, something other than the
@@ -2899,18 +2906,18 @@ async def summarize_text(settings: Settings, text: str) -> str:
         note(f"summarizer overflowed at {len(text):,} chars; splitting")
         combined = (
             "[EARLIER PORTION]\n"
-            f"{await summarize_text(settings, left)}\n\n"
+            f"{await summarize_text(settings, left, session)}\n\n"
             "[LATER PORTION]\n"
-            f"{await summarize_text(settings, right)}"
+            f"{await summarize_text(settings, right, session)}"
         )
         # Always reconcile split summaries, including contradictory next actions.
         if len(combined) >= len(text):
             raise InputTooLarge("Split summaries did not shrink the overflowing input.") from exc
-        return await summarize_text(settings, combined)
+        return await summarize_text(settings, combined, session)
 
 
-async def summarize(settings: Settings, messages: list[Any]) -> str:
-    return await summarize_text(settings, serialize_for_summary(messages))
+async def summarize(settings: Settings, messages: list[Any], session: SessionStore | None = None) -> str:
+    return await summarize_text(settings, serialize_for_summary(messages), session)
 
 
 def checkpoint_part(
@@ -2968,9 +2975,9 @@ def strip_images(history: list[Any]) -> list[Any]:
     return stripped
 
 
-def compaction_tail(history: list[Any], recoveries: int) -> list[Any]:
+def compaction_tail(history: list[Any], recoveries: int, *, context_window: int = 96_000) -> list[Any]:
     """Keep a bounded suffix of complete exchanges, without old checkpoints."""
-    budget = min(context_limits().compact_tail_chars, len(serialize_for_summary(history)) // 4)
+    budget = min(context_limits(context_window).compact_tail_chars, len(serialize_for_summary(history)) // 4)
     # Normal context exhaustion must not progressively erase recent work.
     # Exclude thinking from retained responses, just as the summarizer does.
     cleaned = [
@@ -3002,7 +3009,7 @@ async def compact(
     session: SessionStore | None = None,
 ) -> list[Any]:
     """Replace execution history with one checkpoint and a bounded recent tail."""
-    session = session or active_session
+    limits = context_limits(settings.context_window)
     stream_path = session.save_stream_savepoint() if session is not None else None
     history = strip_images(list(history))
     if not any(isinstance(message, ModelResponse) for message in history):
@@ -3010,19 +3017,20 @@ async def compact(
 
     # Summarize the whole task, including previous checkpoints and any partial
     # final response, before dropping an unanswered tool call from the tail.
-    summary = await summarize(settings, history)
+    summary = await summarize(settings, history, session)
     cnt = 0
-    while len(summary) > context_limits().compact_summary_chars:
+    while len(summary) > limits.compact_summary_chars:
         summary = await summarize_text(
             settings,
             "Consolidate this checkpoint to at most "
-            f"{context_limits().compact_summary_chars} characters. Preserve requirements and "
+            f"{limits.compact_summary_chars} characters. Preserve requirements and "
             "current task state; replace file contents with paths.\n\n" + summary,
+            session,
         )
         cnt += 1
         if cnt > 2:
             break
-    tail = compaction_tail(drop_unanswered_tail(history), recoveries)
+    tail = compaction_tail(drop_unanswered_tail(history), recoveries, context_window=settings.context_window)
     checkpoint = checkpoint_part(summary, stream_path)
     if tail:
         tail[0] = replace(tail[0], parts=[checkpoint, *tail[0].parts])
@@ -3203,9 +3211,9 @@ async def _subagent_turn(
 ) -> dict[str, Any]:
     """One sub-agent run: no recovery loop, no compaction, one attempt."""
     discovery = discover_workspace(settings)
-    # Its own session dir, so the chat survives for debugging. The HTTP
-    # request dumps still go to active_session, which stays the parent's.
+    # Child requests and summaries belong to the child's store, not the parent's.
     session = SessionStore.open(settings.cwd)
+    session.context_window = settings.context_window
     agent = build_agent(
         settings,
         discovery,
@@ -3242,7 +3250,7 @@ async def _subagent_summary(
     if not messages:
         return "(the sub-agent made no calls)"
     try:
-        return await summarize(settings, messages)
+        return await summarize(settings, messages, session)
     except Exception:
         # The endpoint is down or the chat cannot be summarized. The raw
         # call list is still a summary.
@@ -3317,8 +3325,8 @@ async def run_turn(
     next_prompt: str | None = prompt
     recoveries = 0
     started = time.perf_counter()
-    active_session.turn_id = ''.join(random.SystemRandom().choice(string.ascii_uppercase + string.digits) for _ in range(6))
-    active_session.auto_compact_cnt = 0
+    session.turn_id = ''.join(random.SystemRandom().choice(string.ascii_uppercase + string.digits) for _ in range(6))
+    session.auto_compact_cnt = 0
 
     async def recover(reason: str) -> str | None:
         nonlocal history, recoveries
@@ -3335,7 +3343,7 @@ async def run_turn(
             + session.tool_stats_report()
         )
         session.tool_calls.clear()
-        active_session.auto_compact_cnt += 1
+        session.auto_compact_cnt += 1
         note("compacted to one checkpoint plus recent exchanges; resuming")
         return resume_prompt(history, CONTEXT_RECOVERY_PROMPT)
 
@@ -3471,11 +3479,9 @@ async def open_session(
     The agent is entered once so MCP servers stay connected for the whole
     session; :func:`run_turn` retries inside that, never around it.
     """
-    global active_session
     discovery = discover_workspace(settings)
     store = SessionStore.open(settings.cwd, run_id, log_root=Path(log_root).expanduser())
-    active_session = store
-    active_session.context_window = settings.context_window
+    store.context_window = settings.context_window
     agent = build_agent(
         settings, discovery, store, with_subagent_tool=True, capture_stream=True
     )
@@ -3501,11 +3507,9 @@ async def open_bash_machine_session(
 
     ``user`` is the virtual user name inside the BashMachine.
     """
-    global active_session
     discovery = discover_workspace(settings)
     store = SessionStore.open(settings.cwd, run_id, log_root=Path(log_root).expanduser())
-    active_session = store
-    active_session.context_window = settings.context_window
+    store.context_window = settings.context_window
     agent = build_agent(
         settings, discovery, store,
         bash_machine=bash_machine,

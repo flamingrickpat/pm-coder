@@ -181,9 +181,9 @@ Sessions live in `~/.pm/pm-coder/<run_id>/`:
   `--run-id` picks up from the last completed tool call.
 - `runs.jsonl` -- one line per completed turn.
 - `session.json` -- run metadata.
-- `<timestamp>_<n>.compact.json` / `.pretty.json` -- the exact body of every
-  `/chat/completions` request, captured below Pydantic AI's message and tool
-  conversion. One pair per request, so a long session produces a lot of them.
+- `turn_<id>_ac_<count>_<label>_<timestamp>_<sequence>.json` -- the JSON body of each `/chat/completions` request.
+  The logger retains every request in its supplied session directory.
+  The label distinguishes agent requests from compaction requests.
 - `active-stream.jsonl` -- the main agent's current streamed response events.
   It is reset for each main-agent request.
 - `precompact_*.stream.jsonl` -- an immutable copy of `active-stream.jsonl`
@@ -264,6 +264,23 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Concurrent sessions
+
+Each session owns its request logs, turn counters, messages, and tool history.
+Tool and compaction budgets use the supplied settings, not a process-global session.
+Separate sessions can overlap in one event loop or separate threads.
+Automatic run IDs use atomic directory allocation.
+An explicit run ID resumes that directory. Do not run two writers against the same explicit run ID.
+
+`make_shell_tool(settings, session)` writes shell output under that session.
+Without a session, the standalone tool writes under `<cwd>/.pm-coder-shell-output`.
+`build_summary_agent(settings, session)` and `compact(..., session)` retain their own request logs.
+The internal `active_session` global no longer exists.
+The OpenAI client has no generation timeout.
+
+These changes do not establish virtual file permissions or scoped MCP grants.
+Those workflow boundaries require separate integration checks.
 
 ## In-Memory Bash Machine
 
@@ -544,5 +561,7 @@ Symbolic and hard links are disabled in user shells because path aliases can byp
 python -m pip install -e ".[dev]"
 python -m pytest -v test_bash_machine.py   # offline, no endpoint needed
 python -m pytest -v test_llm_coder.py      # needs a live OpenAI-compatible endpoint
+python -m pytest -v test_session_isolation.py
+python -m pytest -v test_session_isolation_live.py  # overlapping real model turns and compaction
 ```
 

@@ -69,8 +69,9 @@ def test_split_summaries_are_merged_even_below_character_budget(tmp_path, monkey
                        4: "Specification read; next write tests."}
             return SimpleNamespace(output=outputs[len(prompts)])
 
-    monkeypatch.setattr(pm_coder, "build_summary_agent", lambda settings: SummaryAgent())
-    result = asyncio.run(pm_coder.summarize_text(None, "history " * 10000))
+    monkeypatch.setattr(pm_coder, "build_summary_agent", lambda settings, session=None: SummaryAgent())
+    settings = pm_coder.build_settings(cwd=tmp_path, model="test", context_window=96_000)
+    result = asyncio.run(pm_coder.summarize_text(settings, "history " * 10000))
     assert result == "Specification read; next write tests."
     assert len(prompts) == 4
     assert "Earlier: read the specification." in prompts[-1]
@@ -96,7 +97,7 @@ def test_selected_external_skill_survives_compaction_and_new_agent(tmp_path, mon
         observed.append(info.instructions)
         return ModelResponse(parts=[TextPart(content="done")])
 
-    async def summary(settings, history):
+    async def summary(settings, history, session=None):
         return "Task remains; all exploratory reads complete."
 
     monkeypatch.setattr(pm_coder, "summarize", summary)
@@ -116,13 +117,3 @@ def test_selected_external_skill_survives_compaction_and_new_agent(tmp_path, mon
     asyncio.run(run())
     assert len(observed) == 3
     assert all(body in instructions for instructions in observed)
-
-
-def setup_module():
-    import tempfile
-    from pathlib import Path
-    import pm_coder
-
-    root = Path(tempfile.mkdtemp(prefix="pm-coder-check-"))
-    pm_coder.active_session = pm_coder.SessionStore.open(root, log_root=root / "sessions")
-    pm_coder.active_session.context_window = 96_000

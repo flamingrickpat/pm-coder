@@ -90,7 +90,7 @@ def test_powershell_start_process_cannot_hold_tool_open(tmp_path: Path) -> None:
     child_pid: int | None = None
     command = (
         '$child = Start-Process -FilePath "$env:SystemRoot\\System32\\ping.exe" '
-        '-ArgumentList "-t","127.0.0.1" -PassThru\n'
+        '-ArgumentList "-t","127.0.0.1" -WindowStyle Hidden -PassThru\n'
         "Write-Output $child.Id\n"
     )
 
@@ -162,13 +162,3 @@ def test_shell_calls_keep_separate_logs(tmp_path):
         assert f"stdout:\n{word}" in result
         assert "output truncated" not in result
     assert sorted(p.read_text().strip() for p in logs.glob("*/stdout.log")) == ["first", "second"]
-
-
-def setup_module():
-    import tempfile
-    from pathlib import Path
-    import pm_coder
-
-    root = Path(tempfile.mkdtemp(prefix="pm-coder-check-"))
-    pm_coder.active_session = pm_coder.SessionStore.open(root, log_root=root / "sessions")
-    pm_coder.active_session.context_window = 96_000
