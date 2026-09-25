@@ -1563,25 +1563,25 @@ class VirtualFiles:
     """The same operations routed into an in-memory BashMachine."""
 
     bash_machine: Any
+    user: str = "user"
 
     def resolve(self, path: str) -> str:
-        # Virtual paths stay as given; relative ones resolve against the
-        # machine's admin cwd (``/home/user``), like its shell commands do.
+        # The machine resolves relative paths against this user's current cwd.
         return path
 
     def is_file(self, target: str) -> bool:
-        return self.bash_machine.is_file(target)
+        return self.bash_machine.is_file_as(self.user, target)
 
     def size(self, target: str) -> int:
         return len(self.read_bytes(target))
 
     def read_bytes(self, target: str) -> bytes:
-        return self.bash_machine.read_binary(target)
+        return self.bash_machine.read_binary_as(self.user, target)
 
     def write_bytes(self, target: str, data: bytes) -> None:
         # The file tools only ever write UTF-8 text; storing it as text keeps
         # BashMachine.read_text and shell `cat` working on tool-written files.
-        self.bash_machine.write_text(target, data.decode("utf-8"))
+        self.bash_machine.write_text_as(self.user, target, data.decode("utf-8"))
 
     def open_text(self, target: str):
         # The machine already holds the file in memory; the bounded reader
@@ -1591,15 +1591,15 @@ class VirtualFiles:
         return io.StringIO(text.replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[Any]]:
+def make_file_tools(settings: Settings, bash_machine: Any = None, *, user: str = "user") -> list[Tool[Any]]:
     """Build read/write/edit against one storage backend.
 
     With ``bash_machine=None`` the tools operate on the real workspace under
     ``settings.cwd``. With a BashMachine they operate on its in-memory
-    filesystem. Signatures and behavior are identical; only the file
-    operations behind the tools switch.
+    filesystem as ``user``. Relative paths use that user's current directory.
+    Denied access returns a tool error without changing the file or its ACL.
     """
-    files = VirtualFiles(bash_machine) if bash_machine is not None else HostFiles(settings)
+    files = VirtualFiles(bash_machine, user) if bash_machine is not None else HostFiles(settings)
     limits = context_limits(settings.context_window)
 
     def read(
@@ -1778,34 +1778,37 @@ def make_file_tools(settings: Settings, bash_machine: Any = None) -> list[Tool[A
             - To create a file use write; old_string must not be empty.
             - The file's line endings (CRLF or LF) are preserved.
         """
-        target = files.resolve(path)
-        print(f"\n[edit {target}]", file=sys.stderr, flush=True)
-        if not files.is_file(target):
-            return f"error: file does not exist: {target}"
-        raw = files.read_bytes(target).decode("utf-8", errors="replace")
-        newline = newline_style(raw)
-        text = raw.replace("\r\n", "\n")
-        old = old_string.replace("\r\n", "\n")
-        new = new_string.replace("\r\n", "\n")
-        if not old:
-            return "error: old_string is empty; use write to create a file"
-        count = text.count(old)
-        if count == 0:
-            return (
-                f"error: no match for old_string in {target}. It must match the "
-                "file exactly, including whitespace and indentation."
-                + match_hint(text, old)
-            )
-        if count > 1 and not replace_all:
-            return (
-                f"error: found {count} matches for old_string in {target}. Add "
-                "surrounding context to make it unique, or pass replace_all=true."
-            )
-        line = text[: text.index(old)].count("\n") + 1
-        updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
-        files.write_bytes(target, updated.replace("\n", newline).encode("utf-8"))
-        where = f"{count} occurrences" if replace_all else f"line {line}"
-        return f"edited {target} ({where}, file is now {len(split_lines(updated))} lines)"
+        try:
+            target = files.resolve(path)
+            print(f"\n[edit {target}]", file=sys.stderr, flush=True)
+            if not files.is_file(target):
+                return f"error: file does not exist: {target}"
+            raw = files.read_bytes(target).decode("utf-8", errors="replace")
+            newline = newline_style(raw)
+            text = raw.replace("\r\n", "\n")
+            old = old_string.replace("\r\n", "\n")
+            new = new_string.replace("\r\n", "\n")
+            if not old:
+                return "error: old_string is empty; use write to create a file"
+            count = text.count(old)
+            if count == 0:
+                return (
+                    f"error: no match for old_string in {target}. It must match the "
+                    "file exactly, including whitespace and indentation."
+                    + match_hint(text, old)
+                )
+            if count > 1 and not replace_all:
+                return (
+                    f"error: found {count} matches for old_string in {target}. Add "
+                    "surrounding context to make it unique, or pass replace_all=true."
+                )
+            line = text[: text.index(old)].count("\n") + 1
+            updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+            files.write_bytes(target, updated.replace("\n", newline).encode("utf-8"))
+            where = f"{count} occurrences" if replace_all else f"line {line}"
+            return f"edited {target} ({where}, file is now {len(split_lines(updated))} lines)"
+        except OSError as exc:
+            return tool_failure(exc)
 
     # These must be ordinary docstrings for the tool schema. Substitute the
     # limits after definition because an f-string would not be a docstring.
@@ -2550,7 +2553,7 @@ def build_agent(
     if settings.enable_write:
         sys_tools.append(shell_tool)
 
-    file_tools = make_file_tools(settings, bash_machine)
+    file_tools = make_file_tools(settings, bash_machine, user=bash_machine_user)
     sys_tools += file_tools
 
     system_prompt = build_system_prompt(
@@ -3171,14 +3174,12 @@ def _run_subagent(
         shared_prompt = ""
     if prompt is None:
         prompt = ""
-    shared_prompt = _subagent_prompt_text(settings, shared_prompt, bash_machine)
-    prompt = _subagent_prompt_text(settings, prompt, bash_machine)
-
-    prompt = f"{shared_prompt}\n{prompt}".strip()
-
-    p = prompt.replace("\n", "\\n")
-    note(f"subagent start: {p}")
     try:
+        shared_prompt = prompt_text(shared_prompt, settings.cwd, bash_machine=bash_machine, user=bash_machine_user)
+        prompt = prompt_text(prompt, settings.cwd, bash_machine=bash_machine, user=bash_machine_user)
+        prompt = f"{shared_prompt}\n{prompt}".strip()
+        p = prompt.replace("\n", "\\n")
+        note(f"subagent start: {p}")
         record.update(
             asyncio.run(
                 _subagent_turn(settings, prompt, bash_machine, bash_machine_user)
@@ -3187,20 +3188,6 @@ def _run_subagent(
     except BaseException as exc:
         record["status"] = f"crashed: {type(exc).__name__}: {exc}"
     note(f"subagent done: {record.get('status', '?')}")
-
-
-def _subagent_prompt_text(
-    settings: Settings, value: str, bash_machine: Any = None
-) -> str:
-    """Literal prompt text, unless it names a file in the active filesystem."""
-    if bash_machine is not None:
-        try:
-            return bash_machine.read_text(value)
-        except Exception:
-            # A nonexistent virtual path is ordinary literal prompt text. Do
-            # not fall through to the host filesystem from a virtual session.
-            return value
-    return prompt_text(value, settings.cwd)
 
 
 async def _subagent_turn(
@@ -3433,8 +3420,17 @@ async def run_turn(
 # ---------------------------------------------------------------------------
 
 
-def prompt_text(prompt_or_path: str | Path, cwd: Path) -> str:
-    """Literal text, unless it names a readable file."""
+def prompt_text(prompt_or_path: str | Path, cwd: Path, *, bash_machine: Any = None, user: str = "user") -> str:
+    """Read a prompt file or return literal text when no file exists.
+
+    A virtual target uses only the supplied user's filesystem view and cwd.
+    Denied access raises PermissionError. Virtual paths never read host files.
+    """
+    if bash_machine is not None:
+        path = str(prompt_or_path)
+        if bash_machine.is_file_as(user, path):
+            return bash_machine.read_binary_as(user, path).decode("utf-8")
+        return path
     candidate = Path(prompt_or_path).expanduser()
     if not candidate.is_absolute():
         candidate = cwd / candidate
@@ -3576,7 +3572,8 @@ async def async_run_auto_with_bash_machine(
         settings, bash_machine, run_id=run_id, log_root=log_root, user=user,
     ) as (agent, _discovery, store):
         return await run_turn(
-            agent, settings, store, prompt_text(prompt_or_path, settings.cwd)
+            agent, settings, store,
+            prompt_text(prompt_or_path, settings.cwd, bash_machine=bash_machine, user=user),
         )
 
 

@@ -279,7 +279,7 @@ Without a session, the standalone tool writes under `<cwd>/.pm-coder-shell-outpu
 The internal `active_session` global no longer exists.
 The OpenAI client has no generation timeout.
 
-These changes do not establish virtual file permissions or scoped MCP grants.
+Session isolation does not establish scoped MCP grants or separate child namespaces.
 Those workflow boundaries require separate integration checks.
 
 ## In-Memory Bash Machine
@@ -389,6 +389,27 @@ In this example:
 The access rules are enforced by the virtual filesystem.
 
 Commands such as `cat`, `grep`, `cp`, `rm`, redirection, and `sed` use the same access rules.
+
+### Agent file tools and prompt files
+
+From version 0.8.0, agent file tools obey the supplied virtual user and its current directory.
+`make_file_tools(settings, vm, user="workflow")` selects that user explicitly.
+`run_auto_with_bash_machine(..., user="workflow")` uses the same user for Bash, file tools, and prompt files.
+Relative paths change when that user runs `cd`.
+Denied reads, writes, and edits return tool errors without changing the protected file.
+
+Prompt paths in virtual runs refer only to virtual files.
+A missing virtual file remains literal prompt text. It never causes a host file read.
+A denied prompt file raises `PermissionError` before inference.
+Subagent prompt files use the supplied parent user. A denied prompt produces a failed child record.
+
+`is_file_as(user, path)`, `read_binary_as(user, path)`, and `write_text_as(user, path, content)` expose the same user-scoped access to Python callers.
+The read and write methods preserve exact bytes and existing file access rules.
+The agent text tools retain their existing newline normalization rules.
+
+The original `read_text`, `read_binary`, and `write_text` methods remain administrative APIs.
+They bypass user access rules and belong to the trusted host application.
+The access policy is per-file, not an inherited directory policy or a sandbox for arbitrary Python.
 
 ### Text and binary files
 

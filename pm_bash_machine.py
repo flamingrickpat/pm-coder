@@ -509,6 +509,34 @@ class BashMachine:
             result = self._admin.run(f"test -f {shlex.quote(path)}")
             return result.exit_code == 0
 
+    def _user_path(self, user: str, path: str) -> str:
+        return _path(posixpath.join(self._users[user].cwd, path))
+
+    def is_file_as(self, user: str, path: str) -> bool:
+        """Inspect a user-visible path relative to that user's current directory."""
+        with self._lock:
+            path = self._user_path(user, path)
+            _UserFs(self, user)._need_read(path)
+            return self.is_file(path)
+
+    def read_binary_as(self, user: str, path: str) -> bytes:
+        """Read exact bytes with the same read permission as the user's shell."""
+        with self._lock:
+            path = self._user_path(user, path)
+            _UserFs(self, user)._need_read(path)
+            if not self.is_file(path):
+                raise FileNotFoundError(path)
+            return self.read_binary(path)
+
+    def write_text_as(self, user: str, path: str, content: str) -> None:
+        """Write text through the user's filesystem view without changing ACLs."""
+        with self._lock:
+            path = self._user_path(user, path)
+            _UserFs(self, user)._need_write(path)
+            parent = posixpath.dirname(path)
+            self.exec(user, f"mkdir -p -- {shlex.quote(parent)} && : > {shlex.quote(path)}").check()
+            self._content[path] = _Content(content, binary=False)
+
     def load_text(
         self,
         real_path: str | os.PathLike[str],
