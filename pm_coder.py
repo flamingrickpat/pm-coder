@@ -192,6 +192,7 @@ NO_LIMITS = UsageLimits(request_limit=None)
 # CLI; anything not listed is an internal detail and may change.
 __all__ = [
     "DiscoveryResult",
+    "PermanentProviderError",
     "SessionStore",
     "Settings",
     "Skill",
@@ -206,6 +207,7 @@ __all__ = [
     "discover_workspace",
     "find_mcp_config",
     "find_skill",
+    "is_permanent_failure",
     "load_skills",
     "loop_alert_injector",
     "make_bash_machine_tool",
@@ -2754,6 +2756,72 @@ def is_unsupported_input(exc: BaseException) -> bool:
     return any(marker in error_text(exc) for marker in UNSUPPORTED_INPUT_MARKERS)
 
 
+# A rejection the endpoint would answer identically on every retry. The
+# reconnect loop is right for a cold or flaky transport, but resampling an
+# authentication, billing, or configuration failure forever hides the fault
+# behind a spin. These surface once as a clear error instead.
+PERMANENT_FAILURE_STATUS = frozenset({401, 402, 403})
+AUTH_FAILURE_MARKERS = (
+    "unauthorized",
+    "invalid api key",
+    "invalid_api_key",
+    "incorrect api key",
+    "authentication",
+    "permission denied",
+    "forbidden",
+)
+QUOTA_FAILURE_MARKERS = (
+    "insufficient_quota",
+    "insufficient quota",
+    "exceeded your current quota",
+    "quota exceeded",
+    "out of credit",
+    "credit balance",
+    "billing",
+    "payment required",
+)
+CONFIG_FAILURE_MARKERS = (
+    "model not found",
+    "unknown model",
+    "invalid model",
+    "no such model",
+    "invalid_request_error",
+    "invalid request",
+)
+
+
+def _mentions_missing_model(text: str) -> bool:
+    """A named model that the endpoint does not serve is a config fault."""
+    return "model" in text and (
+        "not found" in text or "does not exist" in text or "no such" in text
+    )
+
+
+class PermanentProviderError(RuntimeError):
+    """The endpoint rejected the request in a way a retry cannot fix."""
+
+
+def http_status(exc: BaseException) -> int | None:
+    """The HTTP status carried by an SDK error, directly or on its response."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    nested = getattr(response, "status_code", None)
+    return nested if isinstance(nested, int) else None
+
+
+def is_permanent_failure(exc: BaseException) -> bool:
+    """True when retrying the identical request cannot change the outcome."""
+    if http_status(exc) in PERMANENT_FAILURE_STATUS:
+        return True
+    text = error_text(exc)
+    return _mentions_missing_model(text) or any(
+        marker in text
+        for marker in (*AUTH_FAILURE_MARKERS, *QUOTA_FAILURE_MARKERS, *CONFIG_FAILURE_MARKERS)
+    )
+
+
 # pydantic-ai feeds a tool's validation error back to the model as a retry
 # prompt, and raises UnexpectedModelBehavior once the same tool has failed its
 # `retries` times in a row -- the model read the feedback and still emitted
@@ -3362,6 +3430,13 @@ async def run_turn(
             session.save_messages(history)
             if settings.live_test:
                 raise
+
+            if is_permanent_failure(exc):
+                # Auth, billing, and configuration faults repeat byte-for-byte;
+                # fail the turn with the endpoint's own message.
+                raise PermanentProviderError(
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
 
             if is_unprocessed_tool_calls_error(exc):
                 # The endpoint refused the prompt because a tool call sits

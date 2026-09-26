@@ -7,7 +7,9 @@ discovery, project instructions, skills, and read/write/edit/shell
 tools.
 Built to be started once and left running: no request limits, no wall-clock
 limits, and a single recovery loop that compacts its own context and
-reconnects forever.
+reconnects forever on transient transport faults. Authentication, billing,
+and configuration rejections fail the turn once with the endpoint's message
+instead of reconnecting.
 
 ## Install
 
@@ -150,6 +152,10 @@ Every model turn -- interactive or scripted -- goes through one function,
   model that changed underneath you: pm-coder prints
   `<error>, trying reconnect...`, waits 30 seconds, and retries the same turn
   from the work already captured. Tool calls that already ran are not repeated.
+- **A rejection no retry can fix.** An authentication, billing, or model
+  configuration error would be answered identically on every attempt, so
+  pm-coder raises `PermanentProviderError` immediately with the endpoint's
+  own message. `is_permanent_failure(exc)` exposes the classification.
 
 Nothing but Ctrl-C ends the loop. Startup blocks the same way: if the endpoint
 is not up yet and the model id or context window still has to be discovered,
