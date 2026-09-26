@@ -240,6 +240,11 @@ while True:
     print(result["response"])
 ```
 
+Embedded callers can pass `workspace_discovery=False` to disable automatic host instructions, skills, and MCP discovery.
+An explicit `mcp_config` still applies. The caller supplies role instructions in the prompt.
+`live_test=True` reports model failures without the production reconnect loop.
+An explicit empty API key remains empty and does not select an environment credential.
+
 `run_auto` owns the event loop and returns a dictionary, so callers never touch
 asyncio. Use `async_run_auto` from an existing asyncio application; it returns
 a `TurnResult`.

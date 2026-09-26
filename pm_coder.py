@@ -639,6 +639,8 @@ class Settings(BaseModel):
     verbose: bool
     context_window: int = Field(gt=0)
     enable_write: bool
+    workspace_discovery: bool = True
+    live_test: bool = False
 
 
 def probe_endpoint(
@@ -689,7 +691,9 @@ def build_settings(
     skill: str | None = None,
     verbose: bool = False,
     context_window: int = DEFAULT_CONTEXT_WINDOW,
-    enable_write: bool = True
+    enable_write: bool = True,
+    workspace_discovery: bool = True,
+    live_test: bool = False,
 ) -> Settings:
     """Resolve one runtime configuration, probing the endpoint if needed.
 
@@ -705,13 +709,14 @@ def build_settings(
         base_url or env_first("LOCAL_AGENT_BASE_URL", "OPENAI_BASE_URL") or DEFAULT_BASE_URL
     ).rstrip("/")
     resolved_api_key = (
-        api_key or env_first("LOCAL_AGENT_API_KEY", "OPENAI_API_KEY") or "local"
+        api_key if api_key is not None else env_first("LOCAL_AGENT_API_KEY", "OPENAI_API_KEY") or "local"
     )
     resolved_model = model or env_first("LOCAL_AGENT_MODEL", "OPENAI_MODEL")
 
     capabilities: dict[str, Any] | None = None
     if resolved_model is None or context_window <= 0:
-        capabilities = wait_for_endpoint(resolved_base_url, resolved_api_key, model=resolved_model)
+        probe = probe_endpoint if live_test else wait_for_endpoint
+        capabilities = probe(resolved_base_url, resolved_api_key, model=resolved_model)
     if resolved_model is None:
         resolved_model = capabilities["id"]
     if context_window <= 0:
@@ -719,7 +724,7 @@ def build_settings(
         context_window = served
 
     backend = select_shell(shell)
-    resolved_mcp_config = find_mcp_config(cwd_path, mcp_config)
+    resolved_mcp_config = find_mcp_config(cwd_path, mcp_config) if workspace_discovery or mcp_config else None
     return Settings(
         cwd=cwd_path,
         base_url=resolved_base_url,
@@ -733,7 +738,9 @@ def build_settings(
         skill=skill,
         verbose=verbose,
         context_window=context_window,
-        enable_write=enable_write
+        enable_write=enable_write,
+        workspace_discovery=workspace_discovery,
+        live_test=live_test,
     )
 
 
@@ -2031,6 +2038,8 @@ def find_skill(skills: list[Skill], reference: str) -> Skill:
 
 
 def discover_workspace(settings: Settings) -> DiscoveryResult:
+    if not settings.workspace_discovery:
+        return DiscoveryResult([], [], [], "", read_mcp_server_names(settings.mcp_config), None)
     skills, skill_errors = load_skills(settings.cwd)
     selected_skill = find_skill(skills, settings.skill) if settings.skill else None
     instruction_files = discover_instruction_files(settings.cwd)
@@ -3350,6 +3359,8 @@ async def run_turn(
             # repeating side effects; Pydantic AI closes any dangling call.
             history = list(captured) or history
             session.save_messages(history)
+            if settings.live_test:
+                raise
 
             if is_unprocessed_tool_calls_error(exc):
                 # The endpoint refused the prompt because a tool call sits
