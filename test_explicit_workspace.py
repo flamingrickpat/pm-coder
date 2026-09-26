@@ -3,7 +3,7 @@ import socket
 
 import pytest
 
-from pm_coder import build_settings, discover_workspace, run_auto
+from pm_coder import build_settings, discover_workspace, make_model, run_auto
 
 
 def test_explicit_workspace_ignores_ambient_files(tmp_path):
@@ -17,6 +17,7 @@ def test_explicit_workspace_ignores_ambient_files(tmp_path):
     assert discovery.skills == []
     assert discovery.instruction_files == []
     assert discovery.mcp_server_names == []
+    assert make_model(settings, "agent").client.api_key == "local"
 
 
 def test_explicit_workspace_keeps_explicit_mcp(tmp_path):

@@ -2494,7 +2494,8 @@ def make_model(
         session=session if session is not None else stream_session,
         label=label,
         provider=OpenAIProvider(openai_client=AsyncOpenAI(
-            base_url=settings.base_url, api_key=settings.api_key, timeout=None,
+            # The SDK requires a nonempty key even for unauthenticated local endpoints.
+            base_url=settings.base_url, api_key=settings.api_key or "local", timeout=None,
         )),
         profile=OpenAIModelProfile(
             openai_supports_strict_tool_definition=False,
