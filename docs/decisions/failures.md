@@ -62,7 +62,7 @@ This client sends read-only inference requests, so it has no tool effect to roll
 
 A02 tested cancellation after a real server slot became active.
 A later real request succeeded on the same owned service.
-Another active request failed with `RemoteProtocolError` after the owned process terminated.
+Another active request failed with a transport error after the owned process terminated.
 The live runner stores slot observations, client receipts, and the process log.
 The shared chat, embedding, and decision services remained available.
 
