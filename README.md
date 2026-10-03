@@ -19,10 +19,16 @@ Install the latest repository version in another project:
 python -m pip install --upgrade "pm-coder @ git+https://github.com/flamingrickpat/pm-coder"
 ```
 
-The package installs the `pm-coder` command and the `pm_coder` and
-`pm_bash_machine` Python modules, so you can also drive the agent from your
+The package installs the `pm-coder` command and the `pm_coder`,
+`pm_bash_machine`, and `pm_decision` Python modules, so you can also drive the agent from your
 own code -- see [Python API](#python-api) and
 [In-Memory Bash Machine](#in-memory-bash-machine) below.
+
+The optional `pm_decision` client sends typed System One requests without an agent session.
+Import `DecisionClient` or `AsyncDecisionClient` from that module.
+Both expose choice, score, probability, and multi-question calls with diagnostic receipts.
+The caller owns fallback and uncertainty policy.
+See the [decision manual](docs/index.md) for contracts, deployment, cancellation, and measured limits.
 
 ## Run
 

@@ -1,0 +1,27 @@
+{
+  "state": "A01 real Spamuel note task completed and consolidated its artifact. No public chat reply arrived within 600 seconds.",
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": "What does this task report establish?",
+      "criteria": {
+        "COMPLETE": "The note task completed.",
+        "FAILED": "The note task failed.",
+        "INVALID": "Completion is unknown."
+      }
+    },
+    "quality": {
+      "type": "score",
+      "instructions": "How complete is the public response?",
+      "criteria": [
+        "No public reply",
+        "Acknowledgement only",
+        "Useful completion reply"
+      ]
+    },
+    "replied": {
+      "type": "noul",
+      "instructions": "Did a public reply arrive?"
+    }
+  }
+}

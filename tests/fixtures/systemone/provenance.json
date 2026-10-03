@@ -1,0 +1,9 @@
+{
+  "captured_at": "2026-10-03",
+  "endpoint": "http://127.0.0.1:8082/v1/systemone",
+  "build": "b11374-b92761a51",
+  "model": "Laya-BF16.gguf",
+  "source": "Real service requests. The request summarizes the documented A01 Spamuel task gap. It is not an application report or a reviewed quality label.",
+  "chat_endpoint": "http://127.0.0.1:8080/v1/systemone",
+  "chat_status": 404
+}
