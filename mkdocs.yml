@@ -25,4 +25,5 @@ nav:
   - Requests and receipts: decisions/requests.md
   - Failure and cancellation: decisions/failures.md
   - Operation and limits: decisions/operation.md
+  - MCP request timeouts: mcp-timeouts.md
   - API reference: reference/

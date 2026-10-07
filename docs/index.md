@@ -20,6 +20,7 @@ The decision module itself uses Python, Pydantic, and HTTPX.
 | [Failure and cancellation](decisions/failures.md) | Error recovery, cancellation boundaries, and concurrent calls |
 | [Operation and limits](decisions/operation.md) | Real deployment, measured limits, and installation |
 | [Generated API](reference/pm_decision.md) | Exact Python objects, signatures, and source |
+| [MCP request timeouts](mcp-timeouts.md) | Native transport deadlines and cancellation boundaries |
 
 PM's engineering manual records the A02 application receipts.
 Laya is optional.

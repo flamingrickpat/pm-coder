@@ -39,6 +39,7 @@ import difflib
 import io
 import itertools
 import json
+import math
 import os
 import random
 import re
@@ -64,7 +65,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent, Tool, UsageLimits, capture_run_messages
 from pydantic_ai.capabilities import ProcessHistory
-from pydantic_ai.mcp import load_mcp_toolsets
+from pydantic_ai.mcp import MCPToolset, load_mcp_toolsets
 from pydantic_ai.messages import (
     BinaryContent,
     ModelMessagesTypeAdapter,
@@ -207,6 +208,7 @@ __all__ = [
     "discover_workspace",
     "find_mcp_config",
     "find_skill",
+    "load_timed_mcp_toolsets",
     "is_permanent_failure",
     "load_skills",
     "loop_alert_injector",
@@ -2545,6 +2547,30 @@ class SnapshotToolset(WrapperToolset[Any]):
         return result
 
 
+def load_timed_mcp_toolsets(config_path: str | Path) -> list[Any]:
+    """Load normal MCP transports and honor per-server requestTimeoutMs.
+
+    The timeout uses milliseconds in the JSON configuration. It must be a
+    finite positive number. Pydantic AI retains environment expansion and
+    transport configuration. A tool call keeps this deadline during cleanup.
+    This function starts no connection and performs no tool retry.
+    """
+    toolsets = load_mcp_toolsets(config_path)
+    document = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    for index, (name, configuration) in enumerate(document["mcpServers"].items()):
+        timeout = configuration.get("requestTimeoutMs")
+        if timeout is None:
+            continue
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("requestTimeoutMs must be a finite positive number.")
+        # Reuse the expanded transport. Its public transport object retains
+        # headers, environment, and stdio arguments from the normal loader.
+        original = toolsets[index].wrapped
+        toolsets[index] = MCPToolset(original.client.transport, id=name,
+                                    read_timeout=timeout / 1000).prefixed(name)
+    return toolsets
+
+
 def build_agent(
     settings: Settings,
     discovery: DiscoveryResult,
@@ -2594,7 +2620,7 @@ def build_agent(
         )
     )
     mcp_tools = (
-        load_mcp_toolsets(settings.mcp_config) if settings.mcp_config is not None else []
+        load_timed_mcp_toolsets(settings.mcp_config) if settings.mcp_config is not None else []
     )
     toolset = SnapshotToolset(
         CombinedToolset([own_tools, *mcp_tools]),
