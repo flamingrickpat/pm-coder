@@ -139,6 +139,25 @@ The agent is meant to be started once and left alone.
 
 ## Recovery
 
+### Provider protocol and output allocation
+
+Actor and summarizer requests leave the output allocation to the endpoint.
+The context window includes input, tool schemas, and generated output.
+Reserving that entire window for output can reject a request before inference.
+The configured context still controls file windows and automatic compaction.
+
+The `openrouter.ai` host uses Pydantic AI's OpenRouter model and provider adapters.
+Those adapters retain structured `reasoning_details` across tool turns, including block identities and provider formats.
+The request logger records their actual outbound representation.
+Other OpenAI-compatible endpoints retain their existing adapter.
+Adapter selection does not depend on model aliases or task instructions.
+
+For OpenRouter, disabled thinking sends `reasoning.enabled=false`.
+Local endpoints retain `chat_template_kwargs.enable_thinking=false`.
+An enabled thinking setting leaves the provider's default reasoning behavior available.
+
+### Retained work
+
 Every model turn -- interactive or scripted -- goes through one function,
 `run_turn`, which has three failure policies and no exit condition:
 

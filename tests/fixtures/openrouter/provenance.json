@@ -1,0 +1,9 @@
+{
+  "scope": "Original real provider response; protocol regression only, not gameplay acceptance.",
+  "sources": [
+    {
+      "path": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13\\workflow-split\\native-protocol-on-resumed\\provider-response-001.json",
+      "sha256": "c6d01252349d45fc6b761e7833d2e47a3fe32c9c0601524d0dbb2b15c619a5e9"
+    }
+  ]
+}

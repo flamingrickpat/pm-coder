@@ -52,6 +52,7 @@ import textwrap
 import threading
 import time
 import urllib.request
+from urllib.parse import urlsplit
 from abc import ABC, abstractmethod
 from collections import Counter
 from contextlib import asynccontextmanager, suppress
@@ -83,11 +84,13 @@ from pydantic_ai.models.openai import (
     OpenAIChatModelSettings,
     OpenAIModelName,
 )
+from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.profiles import ModelProfileSpec
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers import Provider
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.toolsets import CombinedToolset, FunctionToolset, WrapperToolset
 from pydantic_core import to_jsonable_python
@@ -622,6 +625,14 @@ class LoggingOpenAIChatModel(OpenAIChatModel):
             note(f"prompt logger failed: {exc!r}")
 
 
+class LoggingOpenRouterModel(LoggingOpenAIChatModel, OpenRouterModel):
+    """Keep provider reasoning metadata while retaining the request logger.
+
+    OpenRouter's SDK adapter owns parsing and replay of reasoning blocks.
+    The shared logger records their actual outbound representation.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -647,6 +658,11 @@ class Settings(BaseModel):
     live_test: bool = False
 
 
+def is_openrouter_endpoint(base_url: str) -> bool:
+    """Select the documented protocol by host, independently of model names."""
+    return urlsplit(base_url).hostname == "openrouter.ai"
+
+
 def probe_endpoint(
     base_url: str, api_key: str, *, timeout: float = 10.0, model: str | None = None
 ) -> dict[str, Any] | None:
@@ -668,7 +684,7 @@ def probe_endpoint(
         return None
     entries = payload["data"]
     entry = next(item for item in entries if item["id"] == model) if model else entries[0]
-    n_ctx = entry["context_length"] if "openrouter.ai" in base_url else entry["meta"]["n_ctx"]
+    n_ctx = entry["context_length"] if is_openrouter_endpoint(base_url) else entry["meta"]["n_ctx"]
     return {"id": entry["id"], "n_ctx": n_ctx}
 
 
@@ -2493,11 +2509,16 @@ def make_model(
     settings: Settings, label: str, stream_session: SessionStore | None = None,
     *, session: SessionStore | None = None,
 ) -> Any:
-    model: Any = LoggingOpenAIChatModel(
+    # The service protocol owns reasoning metadata, not a scenario or alias.
+    # Keep local OpenAI-compatible endpoints on their existing adapter.
+    hosted = is_openrouter_endpoint(settings.base_url)
+    model_type = LoggingOpenRouterModel if hosted else LoggingOpenAIChatModel
+    provider_type = OpenRouterProvider if hosted else OpenAIProvider
+    model: Any = model_type(
         settings.model,
         session=session if session is not None else stream_session,
         label=label,
-        provider=OpenAIProvider(openai_client=AsyncOpenAI(
+        provider=provider_type(openai_client=AsyncOpenAI(
             # The SDK requires a nonempty key even for unauthenticated local endpoints.
             base_url=settings.base_url, api_key=settings.api_key or "local", timeout=None,
         )),
@@ -2515,6 +2536,8 @@ def make_model(
 
 def thinking_body(settings: Settings) -> dict[str, Any]:
     if settings.disable_thinking:
+        if is_openrouter_endpoint(settings.base_url):
+            return {"reasoning": {"enabled": False}}
         return {"chat_template_kwargs": {"enable_thinking": False}}
     return {}
 
@@ -2631,7 +2654,8 @@ def build_agent(
         instructions=system_prompt + extra_instructions,
         toolsets=[toolset],
         model_settings=OpenAIChatModelSettings(
-            max_tokens=settings.context_window, # stupid fucking ass setting, keep at max and let autocompact handle it
+            # The context window includes input and tools. Let the endpoint
+            # allocate output instead of reserving the whole window for it.
             parallel_tool_calls=False,
             extra_body=thinking_body(settings),
         ),
@@ -2656,7 +2680,6 @@ def build_summary_agent(settings: Settings, session: SessionStore | None = None)
         ),
         model_settings=OpenAIChatModelSettings(
             temperature=0.0,
-            max_tokens=settings.context_window,
             parallel_tool_calls=False,
             extra_body=thinking_body(settings),
         ),

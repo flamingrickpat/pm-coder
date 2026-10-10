@@ -1,0 +1,74 @@
+{
+  "id": "gen-1791581325-Oz9Sy91lMJujy9p4DlHI",
+  "object": "chat.completion",
+  "created": 1791581325,
+  "model": "qwen/qwen3.8-flash",
+  "provider": "Alibaba",
+  "system_fingerprint": null,
+  "service_tier": null,
+  "choices": [
+    {
+      "index": 0,
+      "logprobs": null,
+      "finish_reason": "tool_calls",
+      "native_finish_reason": "tool_calls",
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "refusal": null,
+        "reasoning": "Let me start by reading the boundary.md file and the request, and the inbox files.\n\nThe instruction says: Use only read and write tools. Do not use shell commands or subagents. Read inbox/original-proof.json. Write outbox/report.yaml with actor_attempt equal to the original identity.actor_attempt.\n\nWorking directory is .../target/probe. Let me read files.\n\nPaths: repository is `...\\workspace`. But working directory is `...\\target\\probe`. Let me read relative to working directory first.\n\nLet me read boundary.md.",
+        "tool_calls": [
+          {
+            "type": "function",
+            "index": 0,
+            "id": "call_080b48dac9da49e6b146c553",
+            "function": {
+              "name": "read",
+              "arguments": "{\"path\": \"C:\\\\source\\\\pm\\\\pm_next_v2\\\\.runtime\\\\alpha\\\\a13\\\\workflow-split\\\\native-protocol-on-resumed\\\\boundary.md\"}"
+            }
+          },
+          {
+            "type": "function",
+            "index": 1,
+            "id": "call_6b24131e35bc489dadda48fb",
+            "function": {
+              "name": "read",
+              "arguments": "{\"path\": \"inbox/original-proof.json\"}"
+            }
+          }
+        ],
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "Let me start by reading the boundary.md file and the request, and the inbox files.\n\nThe instruction says: Use only read and write tools. Do not use shell commands or subagents. Read inbox/original-proof.json. Write outbox/report.yaml with actor_attempt equal to the original identity.actor_attempt.\n\nWorking directory is .../target/probe. Let me read files.\n\nPaths: repository is `...\\workspace`. But working directory is `...\\target\\probe`. Let me read relative to working directory first.\n\nLet me read boundary.md.",
+            "format": "unknown",
+            "index": 0
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 2628,
+    "completion_tokens": 193,
+    "total_tokens": 2821,
+    "cost": 0.00031339,
+    "is_byok": false,
+    "prompt_tokens_details": {
+      "cached_tokens": 1280,
+      "cache_write_tokens": 0,
+      "audio_tokens": 0,
+      "video_tokens": 0
+    },
+    "cost_details": {
+      "upstream_inference_cost": 0.00031339,
+      "upstream_inference_prompt_cost": 0.00022268,
+      "upstream_inference_completions_cost": 9.071e-05
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 111,
+      "image_tokens": 0,
+      "audio_tokens": 0
+    }
+  }
+}
