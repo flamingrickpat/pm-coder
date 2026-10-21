@@ -3415,11 +3415,31 @@ def resume_prompt(history: list[Any], fallback: str) -> str | None:
         return None
     return fallback
 
+def prompt_with_images(prompt: str, images: Sequence[Sequence[Any]]) -> str | list[Any]:
+    """Return the first user turn of a session, with its images before the text.
+
+    ``images`` holds ``(data, media_type)`` pairs. Pydantic AI sends each one
+    as a base64 ``image_url`` part of the same user turn, so the model sees
+    the picture while it reads the task instead of only a description of it.
+    With no images the prompt stays a plain string, so a text-only session
+    keeps its old request bytes.
+
+    An endpoint without an image projector rejects such a request. ``run_turn``
+    reports that failure as its own error instead of dropping the image.
+    """
+    if not images:
+        return prompt
+    parts: list[Any] = [BinaryContent(data, media_type=media_type) for data, media_type in images]
+    parts.append(prompt)
+    return [UserPromptPart(content=parts)]
+
+
 async def run_turn(
     agent: Agent[Any, str],
     settings: Settings,
     session: SessionStore,
     prompt: str,
+    images: Sequence[Sequence[Any]] = (),
 ) -> TurnResult:
     """Run one prompt to completion. The only place a model turn happens.
 
@@ -3432,11 +3452,16 @@ async def run_turn(
       it cannot repair) -> nudge it with a fresh user turn;
     * anything else -> say so, wait, and retry the same turn.
 
+    ``images`` are ``(data, media_type)`` pairs attached to the first send of
+    this turn. Retries resume from the stored history, which already holds
+    them, so no retry re-sends a picture. The history pruner keeps only the
+    newest ones (``keep_recent_images``).
+
     The agent must already be entered (``async with agent``) so MCP servers
     stay connected across retries instead of reconnecting on every hiccup.
     """
     history = session.load_messages()
-    next_prompt: str | None = prompt
+    next_prompt: str | list[Any] | None = prompt_with_images(prompt, images)
     recoveries = 0
     started = time.perf_counter()
     session.turn_id = ''.join(random.SystemRandom().choice(string.ascii_uppercase + string.digits) for _ in range(6))
@@ -3660,6 +3685,7 @@ async def async_run_auto(
     *,
     run_id: str | None = None,
     log_root: str | Path = DEFAULT_LOG_ROOT,
+    images: Sequence[Sequence[Any]] = (),
     **settings_kwargs: Any,
 ) -> TurnResult:
     """Run one prompt to completion and return its result.
@@ -3667,7 +3693,8 @@ async def async_run_auto(
     ``prompt_or_path`` is a path to a UTF-8 text file when it names one, and
     literal prompt text otherwise. Pass the ``run_id`` from an earlier result
     to continue that exact conversation; ``messages.json`` is updated before
-    this returns. Remaining keywords go to :func:`build_settings`.
+    this returns. ``images`` are ``(data, media_type)`` pairs sent with the
+    prompt. Remaining keywords go to :func:`build_settings`.
     """
     settings = build_settings(**settings_kwargs)
     async with open_session(settings, run_id=run_id, log_root=log_root) as (
@@ -3676,7 +3703,7 @@ async def async_run_auto(
         store,
     ):
         return await run_turn(
-            agent, settings, store, prompt_text(prompt_or_path, settings.cwd)
+            agent, settings, store, prompt_text(prompt_or_path, settings.cwd), images
         )
 
 
@@ -3696,12 +3723,14 @@ async def async_run_auto_with_bash_machine(
     user: str = "user",
     run_id: str | None = None,
     log_root: str | Path = DEFAULT_LOG_ROOT,
+    images: Sequence[Sequence[Any]] = (),
     **settings_kwargs: Any,
 ) -> TurnResult:
     """Like :func:`async_run_auto`, but the shell tool runs in ``bash_machine``.
 
     ``bash_machine`` is a :class:`BashMachine` instance. It can be shared
-    across threads.
+    across threads. ``images`` are ``(data, media_type)`` pairs sent with the
+    prompt.
     """
     settings = build_settings(**settings_kwargs)
     async with open_bash_machine_session(
@@ -3710,6 +3739,7 @@ async def async_run_auto_with_bash_machine(
         return await run_turn(
             agent, settings, store,
             prompt_text(prompt_or_path, settings.cwd, bash_machine=bash_machine, user=user),
+            images,
         )
 
 
