@@ -3418,20 +3418,26 @@ def resume_prompt(history: list[Any], fallback: str) -> str | None:
 def prompt_with_images(prompt: str, images: Sequence[Sequence[Any]]) -> str | list[Any]:
     """Return the first user turn of a session, with its images before the text.
 
-    ``images`` holds ``(data, media_type)`` pairs. Pydantic AI sends each one
-    as a base64 ``image_url`` part of the same user turn, so the model sees
-    the picture while it reads the task instead of only a description of it.
-    With no images the prompt stays a plain string, so a text-only session
-    keeps its old request bytes.
+    ``images`` holds ``(data, media_type)`` pairs. The result is user content
+    in the form Pydantic AI accepts, so the agent wraps it in one
+    ``UserPromptPart``. Each image becomes a base64 ``image_url`` part of the
+    same turn, and the model sees the picture while it reads the task instead
+    of only a description of it. With no images the prompt stays a plain
+    string, so a text-only session keeps its old request bytes.
+
+    Do not wrap the items in ``UserPromptPart`` here. The agent already does
+    that, and a nested part reaches the model mapper as an unknown content
+    item, which fails with ``Expected code to be unreachable``.
 
     An endpoint without an image projector rejects such a request. ``run_turn``
     reports that failure as its own error instead of dropping the image.
     """
     if not images:
         return prompt
-    parts: list[Any] = [BinaryContent(data, media_type=media_type) for data, media_type in images]
-    parts.append(prompt)
-    return [UserPromptPart(content=parts)]
+    return [
+        *(BinaryContent(data=data, media_type=media_type) for data, media_type in images),
+        prompt,
+    ]
 
 
 async def run_turn(
