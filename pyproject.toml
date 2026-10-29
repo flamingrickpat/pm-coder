@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pm-coder"
-version = "0.10.2"
+version = "0.10.3"
 description = "An unattended coding agent for local OpenAI-compatible models"
 readme = "README.md"
 license = "MIT"
@@ -28,3 +28,6 @@ pm-coder = "pm_coder:main"
 
 [tool.setuptools]
 py-modules = ["pm_coder", "pm_bash_machine", "pm_decision"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

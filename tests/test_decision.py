@@ -17,7 +17,7 @@ from pm_decision import (
     DecisionInputError, ProbabilityQuestion, ScoreQuestion, _validate_response,
 )
 
-FIXTURE = Path(__file__).parent / "tests/fixtures/systemone"
+FIXTURE = Path(__file__).parent / "fixtures/systemone"
 REQUEST = json.loads((FIXTURE / "captured-request.json").read_text())
 RESPONSE = json.loads((FIXTURE / "captured-response.json").read_text())
 

@@ -7,7 +7,7 @@ Install:
     pip install pytest just-bash==0.2.1
 
 Run:
-    pytest -v test_bash_machine.py
+    pytest -v tests/test_bash_machine.py
 
 The tests use the real just-bash shell and in-memory filesystem.
 No mocks are used.

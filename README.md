@@ -617,9 +617,9 @@ Symbolic and hard links are disabled in user shells because path aliases can byp
 
 ```powershell
 python -m pip install -e ".[dev]"
-python -m pytest -v test_bash_machine.py   # offline, no endpoint needed
-python -m pytest -v test_llm_coder.py      # needs a live OpenAI-compatible endpoint
-python -m pytest -v test_session_isolation.py
-python -m pytest -v test_session_isolation_live.py  # overlapping real model turns and compaction
+python -m pytest -v tests/test_bash_machine.py   # offline, no endpoint needed
+python -m pytest -v tests/test_llm_coder.py      # needs a live OpenAI-compatible endpoint
+python -m pytest -v tests/test_session_isolation.py
+python -m pytest -v tests/test_session_isolation_live.py  # overlapping real model turns and compaction
 ```
 

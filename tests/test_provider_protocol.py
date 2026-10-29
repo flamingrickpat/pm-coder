@@ -14,7 +14,7 @@ from pm_coder import Settings, is_openrouter_endpoint, make_model
 
 
 def test_captured_reasoning_blocks_survive_saved_history(tmp_path):
-    source = Path(__file__).parent/'tests/fixtures/openrouter/native-tool-response.json'
+    source = Path(__file__).parent/'fixtures/openrouter/native-tool-response.json'
     original = json.loads(source.read_text(encoding='utf-8'))
     settings = Settings(cwd=tmp_path, base_url='https://openrouter.ai/api/v1',
         api_key='unused-for-offline-parsing', model=original['model'], mcp_config=None,

@@ -4,7 +4,7 @@ Set LOCAL_AGENT_BASE_URL (or OPENAI_BASE_URL) to point elsewhere.
 Default: http://127.0.0.1:8080/v1
 
 Run:
-    pytest -v test_llm_coder.py
+    pytest -v tests/test_llm_coder.py
 """
 
 from __future__ import annotations
